@@ -1,279 +1,258 @@
 import os
 import asyncio
-import aiohttp
 import logging
 from datetime import datetime
-import pandas as pd
-import ta
-
-from telegram import Update
+import aiohttp
+from telegram import Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
+import ta
+import pandas as pd
 
-# ======================
-# CONFIG
-# ======================
+# ═══════════════════════════════════════════
+#           إعدادات البوت
+# ═══════════════════════════════════════════
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-TIMEFRAME = "15m"
-MAX_PRICE = 10
-SCAN_LIMIT = 100
-COOLDOWN = 1800
-
-EXCLUDED = ["BTC", "ETH"]
+CHECK_INTERVAL = 300
+TOP_SYMBOLS_LIMIT = 100
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
+logger = logging.getLogger(__name__)
 
-bot = None
-sent = {}
+# ═══════════════════════════════════════════
+#     سحب العملات
+# ═══════════════════════════════════════════
 
-# ======================
-# SAFE HTTP (NO SESSION PROBLEMS)
-# ======================
-
-async def fetch(url, params=None):
+async def get_bitunix_symbols():
+    url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=10) as r:
-                return await r.json()
-    except:
-        return None
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                data = await response.json()
 
-# ======================
-# SYMBOLS
-# ======================
+        if data.get('code') == 0:
+            tickers = data.get('data', [])
 
-async def get_symbols():
-    url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
-    data = await fetch(url)
+            sorted_tickers = sorted(
+                [t for t in tickers if t.get('symbol', '').endswith('USDT')],
+                key=lambda x: float(x.get('volume24h', 0)),
+                reverse=True
+            )
 
-    if not data or data.get("code") != 0:
-        return []
+            symbols = [t['symbol'] for t in sorted_tickers[:TOP_SYMBOLS_LIMIT]]
+            logger.info(f"تم سحب {len(symbols)} عملة")
+            return symbols
 
-    symbols = []
+    except Exception as e:
+        logger.error(f"خطأ: {e}")
 
-    for t in data.get("data", []):
-        sym = t.get("symbol", "")
-        price = float(t.get("lastPrice", 0))
+    return ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
 
-        if not sym.endswith("USDT"):
-            continue
+# ═══════════════════════════════════════════
+#     بيانات السوق
+# ═══════════════════════════════════════════
 
-        if any(x in sym for x in EXCLUDED):
-            continue
-
-        if price > MAX_PRICE:
-            continue
-
-        symbols.append(sym)
-
-    return symbols[:SCAN_LIMIT]
-
-# ======================
-# KLINES
-# ======================
-
-async def get_klines(symbol):
+async def get_klines_bitunix(symbol: str, interval: str = "15m", limit: int = 150):
     url = "https://fapi.bitunix.com/api/v1/futures/market/kline"
-    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 120}
-
-    data = await fetch(url, params)
-
-    if not data or "data" not in data or not data["data"]:
-        return None
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
 
     try:
-        df = pd.DataFrame(data["data"])
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                data = await response.json()
 
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = df[c].astype(float)
+        if data.get('code') == 0 and data.get('data'):
+            df = pd.DataFrame(data['data'])
 
-        return df
-    except:
-        return None
+            for col in ['close', 'high', 'low', 'open', 'volume']:
+                df[col] = df[col].astype(float)
 
-# ======================
-# ANALYSIS (SMART BUT LIGHT)
-# ======================
+            return df
 
-def analyze(df):
-    close = df["close"]
+    except Exception as e:
+        logger.error(f"خطأ {symbol}: {e}")
 
-    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
+    return None
 
-    macd = ta.trend.MACD(close)
-    macd_line = macd.macd().iloc[-1]
-    macd_signal = macd.macd_signal().iloc[-1]
+# ═══════════════════════════════════════════
+#         التحليل (مُحسّن)
+# ═══════════════════════════════════════════
 
-    ema20 = ta.trend.EMAIndicator(close, 20).ema_indicator().iloc[-1]
-    ema50 = ta.trend.EMAIndicator(close, 50).ema_indicator().iloc[-1]
+def analyze(df: pd.DataFrame):
+    close = df['close']
 
-    price = close.iloc[-1]
+    rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+
+    macd_ind = ta.trend.MACD(close)
+    macd = macd_ind.macd()
+    macd_sig = macd_ind.macd_signal()
+
+    ema20 = ta.trend.EMAIndicator(close, 20).ema_indicator()
+    ema50 = ta.trend.EMAIndicator(close, 50).ema_indicator()
+
+    current_price = close.iloc[-1]
 
     long_score = 0
     short_score = 0
 
-    if rsi < 55:
+    # RSI (خفيف أكثر = إشارات أكثر)
+    if rsi < 50:
         long_score += 1
-    if rsi > 45:
+    if rsi > 50:
         short_score += 1
 
-    if macd_line > macd_signal:
+    # MACD (أقوى عامل)
+    if macd.iloc[-1] > macd_sig.iloc[-1]:
         long_score += 2
     else:
         short_score += 2
 
-    if price > ema20:
+    # EMA trend
+    if current_price > ema20.iloc[-1]:
         long_score += 1
     else:
         short_score += 1
 
-    if ema20 > ema50:
+    if ema20.iloc[-1] > ema50.iloc[-1]:
         long_score += 1
     else:
         short_score += 1
 
-    volatility = abs(price - ema20) / price
-    if volatility < 0.001:
-        return None, price, rsi, 0
-
-    max_score = 5
-
-    if long_score >= 3:
-        confidence = int((long_score / max_score) * 100)
-        return "LONG", price, rsi, confidence
-
-    if short_score >= 3:
-        confidence = int((short_score / max_score) * 100)
-        return "SHORT", price, rsi, confidence
-
-    return None, price, rsi, 0
-
-# ======================
-# TARGETS
-# ======================
-
-def targets(price, side):
-    if side == "LONG":
-        sl = price * 0.98
-        tps = [price * 1.01, price * 1.02, price * 1.04, price * 1.06, price * 1.10]
+    # ⚡ تخفيف شرط الإشارة (مهم جدًا)
+    if long_score >= 2 and long_score > short_score:
+        signal = "LONG"
+    elif short_score >= 2 and short_score > long_score:
+        signal = "SHORT"
     else:
-        sl = price * 1.02
-        tps = [price * 0.99, price * 0.98, price * 0.96, price * 0.94, price * 0.90]
+        signal = None
 
-    return sl, tps
+    return {
+        "signal": signal,
+        "strength": min(max(long_score, short_score), 5),
+        "rsi": round(rsi, 1),
+        "price": current_price
+    }
 
-# ======================
-# MESSAGE
-# ======================
+# ═══════════════════════════════════════════
+#     الأهداف
+# ═══════════════════════════════════════════
 
-def format_msg(symbol, side, price, rsi, sl, tps, confidence):
-    emoji = "🟢🟢🟢" if side == "LONG" else "🔴🔴🔴"
+def calculate_targets(price: float, signal: str):
+    if signal == "LONG":
+        sl = price * 0.985
+        targets = [price * 1.01, price * 1.02, price * 1.035, price * 1.05, price * 1.08]
+    else:
+        sl = price * 1.015
+        targets = [price * 0.99, price * 0.98, price * 0.965, price * 0.95, price * 0.92]
 
-    return f"""
-📊 تحديث: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+    return sl, targets
 
-{emoji} {symbol} {side} {emoji}
+# ═══════════════════════════════════════════
+#     الرسالة
+# ═══════════════════════════════════════════
 
-📈 ثقة الإشارة: {confidence}%
+def format_signal_message(symbol, price, signal, strength, rsi, sl, targets):
+    coin = symbol.replace("USDT", "")
+    time_now = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
 
-➡️ الدخول: {price:.5f}$
-📊 RSI: {round(rsi,1)}
+    emoji = "🟢🟢🟢" if signal == "LONG" else "🔴🔴🔴"
 
-🎯 TP1: {tps[0]:.5f}$
-🎯 TP2: {tps[1]:.5f}$
-🎯 TP3: {tps[2]:.5f}$
-🎯 TP4: {tps[3]:.5f}$
-🎯 TP5: {tps[4]:.5f}$
+    return (
+        f"📊 تحديث: {time_now}\n\n"
+        f"{emoji} {coin} {signal} {emoji}\n\n"
+        f"➡️ الدخول: {price:.6f}$\n"
+        f"⭐ القوة: {strength}/5\n"
+        f"📊 RSI: {rsi}\n\n"
+        f"🎯 TP1: {targets[0]:.6f}$\n"
+        f"🎯 TP2: {targets[1]:.6f}$\n"
+        f"🎯 TP3: {targets[2]:.6f}$\n"
+        f"🎯 TP4: {targets[3]:.6f}$\n"
+        f"🎯 TP5: {targets[4]:.6f}$\n\n"
+        f"🛑 SL: {sl:.6f}$\n\n"
+        f"🏦 Bitunix Futures"
+    )
 
-🛑 SL: {sl:.5f}$
+# ═══════════════════════════════════════════
+#     فحص السوق
+# ═══════════════════════════════════════════
 
-🏦 Bitunix Futures
-"""
+sent_signals = {}
 
-# ======================
-# PROCESS
-# ======================
+async def scan_market(bot: Bot):
+    logger.info("🔍 فحص السوق...")
 
-async def process(symbol):
-    try:
-        df = await get_klines(symbol)
-        if df is None or len(df) < 50:
-            return
+    symbols = await get_bitunix_symbols()
 
-        signal, price, rsi, confidence = analyze(df)
-
-        if not signal or confidence < 55:
-            return
-
-        key = symbol + signal
-        now = asyncio.get_event_loop().time()
-
-        if key in sent and now - sent[key] < COOLDOWN:
-            return
-
-        sl, tps = targets(price, signal)
-
-        msg = format_msg(symbol, signal, price, rsi, sl, tps, confidence)
-
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
-
-        sent[key] = now
-
-    except:
-        pass
-
-# ======================
-# SCAN LOOP (SAFE)
-# ======================
-
-async def scan():
-    symbols = await get_symbols()
-    tasks = [process(s) for s in symbols]
-    await asyncio.gather(*tasks)
-
-# ======================
-# LOOP (NO CRASH)
-# ======================
-
-async def auto_loop():
-    while True:
+    for symbol in symbols:
         try:
-            await scan()
-        except:
-            pass
-        await asyncio.sleep(300)
+            df = await get_klines_bitunix(symbol)
 
-# ======================
-# COMMANDS
-# ======================
+            if df is None or len(df) < 100:
+                continue
+
+            analysis = analyze(df)
+
+            if not analysis["signal"]:
+                continue
+
+            key = symbol + analysis["signal"]
+            now = asyncio.get_event_loop().time()
+
+            if now - sent_signals.get(key, 0) < 1800:
+                continue
+
+            sl, targets = calculate_targets(analysis["price"], analysis["signal"])
+
+            message = format_signal_message(
+                symbol,
+                analysis["price"],
+                analysis["signal"],
+                analysis["strength"],
+                analysis["rsi"],
+                sl,
+                targets
+            )
+
+            await bot.send_message(chat_id=CHAT_ID, text=message)
+            sent_signals[key] = now
+
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"خطأ {symbol}: {e}")
+
+        await asyncio.sleep(0.3)
+
+    logger.info("✅ انتهى الفحص")
+
+# ═══════════════════════════════════════════
+#     أوامر التليجرام
+# ═══════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔥 البوت شغال وجاهز")
+    await update.message.reply_text("🔥 البوت شغال وجاهز للإشارات")
 
-async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 جاري الفحص...")
-    await scan()
+    await scan_market(context.bot)
     await update.message.reply_text("✅ انتهى")
 
-# ======================
-# MAIN (RAILWAY SAFE)
-# ======================
+# ═══════════════════════════════════════════
+#     التشغيل (Railway آمن)
+# ═══════════════════════════════════════════
 
 def main():
-    global bot
-
-    app = Application.builder().token(TOKEN).build()
-    bot = app.bot
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scan", scan_now))
+    app.add_handler(CommandHandler("scan", scan))
 
-    asyncio.create_task(auto_loop())
+    app.job_queue.run_repeating(scan_market, interval=CHECK_INTERVAL, first=10)
 
-    print("Bot running...")
+    logger.info("🚀 Bot running...")
     app.run_polling()
 
 if __name__ == "__main__":

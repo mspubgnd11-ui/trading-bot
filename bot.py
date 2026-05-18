@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -13,24 +12,24 @@ import pandas as pd
 import numpy as np
 
 # ═══════════════════════════════════════════
-#           إعدادات البوت
+# إعدادات البوت
 # ═══════════════════════════════════════════
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID           = os.getenv("CHAT_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-CHECK_INTERVAL       = 300    # فحص كل 5 دقائق
-MAX_PRICE            = 10.0   # عملات تحت $10
-MAX_SYMBOLS          = 150    # أكبر 150 عملة
-MIN_CONFIDENCE       = 70     # فقط الصفقات القوية
-TECH_SCORE_THRESHOLD  = 5      # نقاط القوة الفنية المطلوبة
-SIGNAL_COOLDOWN      = 300     # 5 دقائق بين نفس الإشارة
+CHECK_INTERVAL  = 300    # كل 5 دقائق
+MAX_PRICE       = 10.0   # عملات تحت $10
+MAX_SYMBOLS     = 150    # أكبر 150 عملة
+MIN_CONFIDENCE  = 70     # أدنى نسبة ثقة
+SIGNAL_COOLDOWN = 300    # 5 دقائق بين نفس الإشارة
+TECH_SCORE_THRESHOLD = 5 # فقط الصفقات القوية
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════
-#     سحب العملات من Bitunix
+# سحب العملات من Bitunix
 # ═══════════════════════════════════════════
 async def get_symbols():
     url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
@@ -53,7 +52,7 @@ async def get_symbols():
                 "DOTUSDT","LINKUSDT","LTCUSDT","MATICUSDT","ATOMUSDT"]
 
 # ═══════════════════════════════════════════
-#     سحب الشمعدانات
+# سحب الشمعدانات
 # ═══════════════════════════════════════════
 async def get_klines(symbol: str, interval="15m", limit=200):
     url = "https://fapi.bitunix.com/api/v1/futures/market/kline"
@@ -79,7 +78,7 @@ async def get_klines(symbol: str, interval="15m", limit=200):
     return None
 
 # ═══════════════════════════════════════════
-#     التحليل الفني
+# التحليل الفني
 # ═══════════════════════════════════════════
 def technical_analysis(df: pd.DataFrame):
     if len(df) < 50:
@@ -111,17 +110,18 @@ def technical_analysis(df: pd.DataFrame):
     bb       = ta.volatility.BollingerBands(close, window=20)
     bb_lower = bb.bollinger_lband().iloc[-1]
     bb_upper = bb.bollinger_hband().iloc[-1]
-    bb_pct   = bb.bollinger_pband().iloc[-1]
 
-    # Volume
+    # Volume surge
     vol_avg   = volume.rolling(20).mean().iloc[-1]
     vol_cur   = volume.iloc[-1]
-    vol_surge = bool(vol_cur > vol_avg * 1.5)
+    vol_surge = vol_cur > vol_avg * 1.5
 
     # ATR
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
 
+    # نقاط LONG وSHORT
     long_pts = short_pts = 0
+
     if rsi_val < 50: long_pts += 2
     if rsi_val < 40: long_pts += 1
     if macd_cross_up: long_pts += 3
@@ -158,21 +158,24 @@ def technical_analysis(df: pd.DataFrame):
         "direction":      direction,
         "tech_score":     tech_score,
         "price":          price,
-        "rsi":            round(rsi_val, 1),
+        "rsi":            round(rsi_val,1),
         "macd_desc":      macd_desc,
         "vol_surge":      vol_surge,
         "atr":            atr,
-        "ema9":           round(ema9, 6),
-        "ema21":          round(ema21, 6),
-        "price_change_1h": round(((price - close.iloc[-4])/close.iloc[-4])*100,2),
+        "ema9":           round(ema9,6),
+        "ema21":          round(ema21,6),
     }
 
 # ═══════════════════════════════════════════
-#     تحليل AI
+# أهداف وقف الخسارة
 # ═══════════════════════════════════════════
-async def ai_analysis(symbol: str, data: dict) -> dict:
-    if not ANTHROPIC_API_KEY:
-        conf = min(99, int((data['tech_score'] / 10) * 100) + np.random.randint(0, 10))
-        return {"confidence": conf, "comment": "تحليل فني"}
-    coin = symbol.replace("USDT","")
-    prompt = f"""أنت محلل
+def make_targets(price: float, signal: str):
+    if signal == "LONG":
+        sl   = round(price * 0.985, 8)
+        tps  = [round(price * m, 8) for m in [1.005,1.010,1.015,1.025,1.040]]
+        pcts = ["+0.5%","+1%","+1.5%","+2.5%","+4%"]
+        sl_p = "-1.5%"
+    else:
+        sl   = round(price * 1.015, 8)
+        tps  = [round(price * m, 8) for m in [0.995,0.990,0.985,0.975,0.960]]
+        pcts = ["-0.5%","

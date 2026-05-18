@@ -1,666 +1,621 @@
-
 import os
 import asyncio
 import logging
 import json
-import pickle
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, date
 import aiohttp
 from telegram import Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
 import ta
 import pandas as pd
 import numpy as np
 
-# ══════════════════════════════════════════════════════════════════
-#                         الإعدادات
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#           إعدادات البوت
+# ═══════════════════════════════════════════
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID           = os.getenv("CHAT_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-CHECK_INTERVAL    = 420      # فحص كل 7 دقايق
+CHECK_INTERVAL    = 180      # فحص كل 3 دقائق
 MAX_PRICE         = 10.0     # عملات تحت $10
-MAX_SYMBOLS       = 80       # أفضل 80 عملة بالحجم
-SIGNAL_COOLDOWN   = 14400    # 4 ساعات بين نفس الإشارة
-MAX_PER_SCAN      = 2        # أقصى إشارتين بكل فحص
-SIGNALS_FILE      = "sent_signals.pkl"  # ملف دائم — ما يصفّر لو البوت أعاد تشغيل
+MAX_SYMBOLS       = 150      # أكبر 150 عملة
+MIN_CONFIDENCE    = 70       # ✅ رُفع من 25 إلى 70
+MIN_INDICATORS    = 3        # ✅ جديد: لازم 3 مؤشرات على الأقل تتوافق
+SIGNAL_COOLDOWN   = 3600     # ✅ رُفع إلى ساعة كاملة بين نفس العملة
+GLOBAL_COOLDOWN   = 120      # ✅ جديد: دقيقتين بين أي إشارتين
+DAILY_MAX         = 15       # ✅ جديد: حد يومي 15 إشارة
+TREND_MIN_SLOPE   = 0.0003   # ✅ جديد: للتأكد من وجود اتجاه وليس تذبذب
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════════
-#              حفظ وتحميل الإشارات (دائم — لا يصفّر)
-# ══════════════════════════════════════════════════════════════════
-def load_signals() -> dict:
-    try:
-        if Path(SIGNALS_FILE).exists():
-            with open(SIGNALS_FILE, "rb") as f:
-                return pickle.load(f)
-    except Exception:
-        pass
-    return {}
+# ═══════════════════════════════════════════
+#     متتبع الإشارات اليومية
+# ═══════════════════════════════════════════
+sent_signals:     dict = {}   # {key: timestamp}
+daily_count:      int  = 0
+daily_reset_date: date = date.today()
+last_signal_time: float = 0.0  # آخر وقت إرسال أي إشارة
 
-def save_signals(data: dict):
-    try:
-        with open(SIGNALS_FILE, "wb") as f:
-            pickle.dump(data, f)
-    except Exception as e:
-        logger.error(f"خطأ حفظ: {e}")
 
-def is_on_cooldown(key: str) -> bool:
-    signals = load_signals()
-    last = signals.get(key)
-    if not last:
-        return False
-    return (datetime.utcnow() - last).total_seconds() < SIGNAL_COOLDOWN
+def check_daily_limit() -> bool:
+    """يرجع True إذا لم نصل للحد اليومي بعد."""
+    global daily_count, daily_reset_date
+    today = date.today()
+    if today != daily_reset_date:
+        daily_count      = 0
+        daily_reset_date = today
+    return daily_count < DAILY_MAX
 
-def record_signal(key: str):
-    signals = load_signals()
-    signals[key] = datetime.utcnow()
-    # تنظيف القديم (أكثر من 24 ساعة)
-    cutoff = datetime.utcnow() - timedelta(hours=24)
-    signals = {k: v for k, v in signals.items() if v > cutoff}
-    save_signals(signals)
 
-# ══════════════════════════════════════════════════════════════════
-#                     سحب العملات
-# ══════════════════════════════════════════════════════════════════
-async def get_symbols() -> list:
+def increment_daily():
+    global daily_count
+    daily_count += 1
+
+
+# ═══════════════════════════════════════════
+#     سحب العملات من Bitunix
+# ═══════════════════════════════════════════
+async def get_symbols():
     url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 data = await r.json()
-        tickers = data.get("data", [])
+        tickers = data.get('data', [])
         filtered = [
-            (t["symbol"], float(t.get("volume24h", 0) or 0))
+            (t['symbol'], float(t.get('volume24h', 0) or 0))
             for t in tickers
-            if t.get("symbol", "").endswith("USDT")
-            and 0 < float(t.get("lastPrice", 0) or 0) < MAX_PRICE
+            if t.get('symbol', '').endswith('USDT')
+            and 0 < float(t.get('lastPrice', 0) or 0) < MAX_PRICE
         ]
         filtered.sort(key=lambda x: x[1], reverse=True)
         return [s[0] for s in filtered[:MAX_SYMBOLS]]
     except Exception as e:
         logger.error(f"خطأ العملات: {e}")
-        return ["XRPUSDT", "DOGEUSDT", "ADAUSDT", "TRXUSDT", "SHIBUSDT"]
+        return ["XRPUSDT", "DOGEUSDT", "ADAUSDT", "TRXUSDT", "SHIBUSDT",
+                "DOTUSDT", "LINKUSDT", "LTCUSDT", "MATICUSDT", "ATOMUSDT"]
 
-# ══════════════════════════════════════════════════════════════════
-#                   سحب الشمعدانات
-# ══════════════════════════════════════════════════════════════════
-async def get_klines(symbol: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame | None:
+
+# ═══════════════════════════════════════════
+#     سحب الشمعدانات — ✅ تغيير إلى 5m
+# ═══════════════════════════════════════════
+async def get_klines(symbol: str, interval="5m", limit=200):
     url = "https://fapi.bitunix.com/api/v1/futures/market/kline"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
                 data = await r.json()
-        if data.get("code") == 0 and data.get("data"):
-            df = pd.DataFrame(data["data"])
-            for col in ["open", "high", "low", "close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["volume"] = pd.to_numeric(
-                df.get("quoteVol", df.get("baseVol", pd.Series([1.0] * len(df)))),
-                errors="coerce"
-            )
-            df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+        if data.get('code') == 0 and data.get('data'):
+            df = pd.DataFrame(data['data'])
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            if 'quoteVol' in df.columns:
+                df['volume'] = pd.to_numeric(df['quoteVol'], errors='coerce')
+            elif 'baseVol' in df.columns:
+                df['volume'] = pd.to_numeric(df['baseVol'], errors='coerce')
+            else:
+                df['volume'] = 1.0
+            df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
             return df
     except Exception as e:
-        logger.error(f"خطأ كلاين {symbol} {interval}: {e}")
+        logger.error(f"خطأ كلاين {symbol}: {e}")
     return None
 
-# ══════════════════════════════════════════════════════════════════
-#           التحليل الفني — متعدد الإطارات الزمنية
-# ══════════════════════════════════════════════════════════════════
-def analyze_timeframe(df: pd.DataFrame) -> dict | None:
-    """تحليل إطار زمني واحد — يُستدعى مرتين (15m و 1h)"""
-    if len(df) < 60:
+
+# ═══════════════════════════════════════════
+#     التحليل الفني — ✅ مع فلتر الاتجاه والمؤشرات
+# ═══════════════════════════════════════════
+def technical_analysis(df: pd.DataFrame):
+    if len(df) < 50:
         return None
 
-    close  = df["close"]
-    high   = df["high"]
-    low    = df["low"]
-    volume = df["volume"]
+    close  = df['close']
+    high   = df['high']
+    low    = df['low']
+    volume = df['volume']
     price  = close.iloc[-1]
 
-    # ── RSI ──────────────────────────────────────────────────────
-    rsi     = ta.momentum.RSIIndicator(close, window=14).rsi()
-    rsi_cur = rsi.iloc[-1]
-    rsi_pre = rsi.iloc[-2]
+    # ─── RSI ───────────────────────────────
+    rsi_val   = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+    rsi_long  = rsi_val < 45
+    rsi_short = rsi_val > 55
 
-    # ── MACD ─────────────────────────────────────────────────────
+    # ─── MACD ──────────────────────────────
     macd_obj        = ta.trend.MACD(close)
     macd_line       = macd_obj.macd()
     macd_sig        = macd_obj.macd_signal()
-    macd_hist       = macd_obj.macd_diff()
-    cross_up        = macd_line.iloc[-1] > macd_sig.iloc[-1] and macd_line.iloc[-2] <= macd_sig.iloc[-2]
-    cross_down      = macd_line.iloc[-1] < macd_sig.iloc[-1] and macd_line.iloc[-2] >= macd_sig.iloc[-2]
-    hist_bull       = macd_hist.iloc[-1] > 0 and macd_hist.iloc[-1] > macd_hist.iloc[-2]
-    hist_bear       = macd_hist.iloc[-1] < 0 and macd_hist.iloc[-1] < macd_hist.iloc[-2]
+    macd_cross_up   = macd_line.iloc[-1] > macd_sig.iloc[-1] and macd_line.iloc[-2] <= macd_sig.iloc[-2]
+    macd_cross_down = macd_line.iloc[-1] < macd_sig.iloc[-1] and macd_line.iloc[-2] >= macd_sig.iloc[-2]
+    macd_bull       = macd_line.iloc[-1] > macd_sig.iloc[-1]
+    macd_bear       = macd_line.iloc[-1] < macd_sig.iloc[-1]
+    macd_long       = macd_cross_up or macd_bull
+    macd_short      = macd_cross_down or macd_bear
 
-    # ── EMA ──────────────────────────────────────────────────────
+    # ─── EMA ───────────────────────────────
     ema9  = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
     ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
     ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
-    golden = ema9 > ema21 > ema50
-    death  = ema9 < ema21 < ema50
+    ema_long  = price > ema9 and ema9 > ema21
+    ema_short = price < ema9 and ema9 < ema21
 
-    # ── Bollinger ────────────────────────────────────────────────
+    # ─── Bollinger ─────────────────────────
     bb       = ta.volatility.BollingerBands(close, window=20)
-    bb_low   = bb.bollinger_lband().iloc[-1]
-    bb_high  = bb.bollinger_hband().iloc[-1]
-    bb_mid   = bb.bollinger_mavg().iloc[-1]
+    bb_lower = bb.bollinger_lband().iloc[-1]
+    bb_upper = bb.bollinger_hband().iloc[-1]
     bb_pct   = bb.bollinger_pband().iloc[-1]
+    bb_long  = price <= bb_lower * 1.015
+    bb_short = price >= bb_upper * 0.985
 
-    # ── Volume ───────────────────────────────────────────────────
+    # ─── Volume ────────────────────────────
     vol_avg   = volume.rolling(20).mean().iloc[-1]
     vol_cur   = volume.iloc[-1]
-    vol_ratio = vol_cur / vol_avg if vol_avg > 0 else 1
-    vol_surge = vol_ratio >= 1.8
+    vol_surge = bool(vol_cur > vol_avg * 1.6)  # رُفع المعيار لـ 1.6
+    vol_long  = vol_surge and price > close.iloc[-2]
+    vol_short = vol_surge and price < close.iloc[-2]
 
-    # ── Stochastic ───────────────────────────────────────────────
-    stoch_k = ta.momentum.StochasticOscillator(high, low, close).stoch().iloc[-1]
-
-    # ── ATR ──────────────────────────────────────────────────────
+    # ─── ATR ───────────────────────────────
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
 
-    # ── تغيير السعر ──────────────────────────────────────────────
-    chg_1h  = round(((price - close.iloc[-4])  / close.iloc[-4])  * 100, 2) if len(close) > 4  else 0
-    chg_4h  = round(((price - close.iloc[-16]) / close.iloc[-16]) * 100, 2) if len(close) > 16 else 0
-    chg_24h = round(((price - close.iloc[-96]) / close.iloc[-96]) * 100, 2) if len(close) > 96 else 0
+    # ─── ✅ فلتر الاتجاه (منع التذبذب) ─────
+    # نحسب ميل EMA50 على آخر 10 شموع
+    ema50_series = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+    slope = (ema50_series.iloc[-1] - ema50_series.iloc[-10]) / (ema50_series.iloc[-10] + 1e-10)
+    has_uptrend   = slope > TREND_MIN_SLOPE
+    has_downtrend = slope < -TREND_MIN_SLOPE
+    has_trend     = has_uptrend or has_downtrend
+
+    # ─── تغيير السعر ───────────────────────
+    price_change_1h = round(((price - close.iloc[-12]) / close.iloc[-12]) * 100, 2)  # 12×5m = 1h
+    price_change_4h = round(((price - close.iloc[-48]) / close.iloc[-48]) * 100, 2)  # 48×5m = 4h
+
+    # ─── ✅ حساب المؤشرات المتوافقة ──────────
+    long_indicators  = sum([rsi_long, macd_long, ema_long, bb_long, vol_long])
+    short_indicators = sum([rsi_short, macd_short, ema_short, bb_short, vol_short])
+
+    # ─── تحديد الاتجاه بشروط صارمة ─────────
+    if (long_indicators >= MIN_INDICATORS and long_indicators > short_indicators
+            and has_trend and has_uptrend):
+        direction   = "LONG"
+        tech_score  = long_indicators
+        indicator_n = long_indicators
+    elif (short_indicators >= MIN_INDICATORS and short_indicators > long_indicators
+            and has_trend and has_downtrend):
+        direction   = "SHORT"
+        tech_score  = short_indicators
+        indicator_n = short_indicators
+    else:
+        return None  # لا يكفي توافق أو لا يوجد اتجاه واضح
+
+    # ─── وصف MACD ──────────────────────────
+    if macd_cross_up:    macd_desc = "تقاطع صاعد 🚀"
+    elif macd_cross_down: macd_desc = "تقاطع هابط 🔻"
+    elif macd_bull:       macd_desc = "صاعد 📈"
+    else:                 macd_desc = "هابط 📉"
 
     return {
-        "price": price, "rsi": round(rsi_cur, 1), "rsi_prev": round(rsi_pre, 1),
-        "cross_up": cross_up, "cross_down": cross_down,
-        "hist_bull": hist_bull, "hist_bear": hist_bear,
-        "ema9": round(ema9, 6), "ema21": round(ema21, 6), "ema50": round(ema50, 6),
-        "golden": golden, "death": death,
-        "bb_pct": round(bb_pct, 2), "bb_low": round(bb_low, 8), "bb_high": round(bb_high, 8),
-        "stoch_k": round(stoch_k, 1),
-        "vol_surge": vol_surge, "vol_ratio": round(vol_ratio, 1),
-        "atr": atr, "chg_1h": chg_1h, "chg_4h": chg_4h, "chg_24h": chg_24h,
+        "direction":       direction,
+        "tech_score":      tech_score,
+        "indicator_count": indicator_n,
+        "price":           price,
+        "rsi":             round(rsi_val, 1),
+        "macd_desc":       macd_desc,
+        "macd_cross_up":   macd_cross_up,
+        "macd_cross_down": macd_cross_down,
+        "bb_pct":          round(bb_pct, 2),
+        "vol_surge":       vol_surge,
+        "atr":             atr,
+        "ema9":            round(ema9, 6),
+        "ema21":           round(ema21, 6),
+        "ema50":           round(ema50, 6),
+        "price_change_1h": price_change_1h,
+        "price_change_4h": price_change_4h,
+        # تفاصيل المؤشرات لتحليل الطلب
+        "rsi_ok":    rsi_long if direction == "LONG" else rsi_short,
+        "macd_ok":   macd_long if direction == "LONG" else macd_short,
+        "ema_ok":    ema_long if direction == "LONG" else ema_short,
+        "bb_ok":     bb_long if direction == "LONG" else bb_short,
+        "vol_ok":    vol_long if direction == "LONG" else vol_short,
     }
 
-def strict_signal(tf15: dict, tf1h: dict) -> dict | None:
-    """
-    ══ منطق الإشارة الصارم ══
-    يشترط تأكيد من إطارين زمنيين + 4 شروط من 5 على الأقل
-    """
 
-    def score_direction(tf: dict, direction: str) -> int:
-        pts = 0
-        if direction == "LONG":
-            if tf["cross_up"]:                              pts += 4   # تقاطع MACD صاعد
-            elif tf["hist_bull"]:                           pts += 2   # زخم MACD صاعد
-            if tf["rsi"] < 35:                              pts += 3   # ذروة بيع
-            elif tf["rsi"] < 45:                            pts += 2
-            if tf["rsi"] > tf["rsi_prev"] and tf["rsi"] < 60: pts += 1  # RSI يرتد
-            if tf["golden"]:                                pts += 3   # EMA golden cross
-            elif tf["ema9"] > tf["ema21"]:                  pts += 1
-            if tf["price"] <= tf["bb_low"] * 1.015:        pts += 3   # عند البولنجر السفلي
-            if tf["vol_surge"] and tf["chg_1h"] > 0:       pts += 2   # حجم + حركة
-            if tf["stoch_k"] < 25:                         pts += 2   # ذروة بيع ستوكاستيك
-        else:
-            if tf["cross_down"]:                            pts += 4
-            elif tf["hist_bear"]:                           pts += 2
-            if tf["rsi"] > 65:                              pts += 3
-            elif tf["rsi"] > 55:                            pts += 2
-            if tf["rsi"] < tf["rsi_prev"] and tf["rsi"] > 40: pts += 1
-            if tf["death"]:                                 pts += 3
-            elif tf["ema9"] < tf["ema21"]:                  pts += 1
-            if tf["price"] >= tf["bb_high"] * 0.985:       pts += 3
-            if tf["vol_surge"] and tf["chg_1h"] < 0:       pts += 2
-            if tf["stoch_k"] > 75:                         pts += 2
-        return pts
-
-    for direction in ["LONG", "SHORT"]:
-        s15 = score_direction(tf15, direction)
-        s1h = score_direction(tf1h, direction)
-
-        # ★ الشروط الصارمة: نقاط كافية على كلا الإطارين
-        if s15 >= 8 and s1h >= 5:
-            # ★ تأكيد المومنتوم: على الأقل تقاطع أو زخم حقيقي على 15m
-            has_momentum = (
-                tf15["cross_up"] if direction == "LONG" else tf15["cross_down"]
-            ) or (
-                tf15["hist_bull"] if direction == "LONG" else tf15["hist_bear"]
-            )
-            if not has_momentum:
-                continue
-
-            # ★ RSI في منطقة منطقية (ليس محايداً 45-55)
-            rsi = tf15["rsi"]
-            if direction == "LONG"  and 48 < rsi < 58: continue
-            if direction == "SHORT" and 42 < rsi < 52: continue
-
-            return {
-                "direction": direction,
-                "score_15m": s15,
-                "score_1h":  s1h,
-                **{k: v for k, v in tf15.items()},   # بيانات 15m
-                "rsi_1h":    tf1h["rsi"],
-                "golden_1h": tf1h["golden"],
-                "death_1h":  tf1h["death"],
-                "vol_1h":    tf1h["vol_surge"],
-            }
-    return None
-
-# ══════════════════════════════════════════════════════════════════
-#                    تحليل Claude AI
-# ══════════════════════════════════════════════════════════════════
-async def ai_signal_review(symbol: str, sig: dict) -> dict:
-    """مراجعة الإشارة التلقائية — موجز"""
+# ═══════════════════════════════════════════
+#     تحليل Claude AI — ✅ مع fallback قوي
+# ═══════════════════════════════════════════
+async def ai_analysis(symbol: str, data: dict) -> dict:
+    """يستدعي AI فقط إذا وجد ANTHROPIC_API_KEY، وإلا يستخدم التحليل الفني."""
     if not ANTHROPIC_API_KEY:
-        conf = min(95, int(((sig["score_15m"] + sig["score_1h"]) / 26) * 100))
-        return {"confidence": conf, "verdict": "تحليل فني", "tip": ""}
+        return _fallback_analysis(data)
 
-    coin = symbol.replace("USDT", "")
-    prompt = f"""أنت محلل عملات رقمية خبير. قيّم هذه الإشارة بدقة وحياد.
+    coin   = symbol.replace("USDT", "")
+    prompt = f"""أنت محلل تداول خبير للعملات الرقمية. حلل هذه الصفقة بدقة وأعط نسبة ثقة.
 
-العملة: {coin}/USDT  |  الاتجاه: {sig["direction"]}  |  السعر: {sig["price"]}
+العملة: {coin}/USDT
+الاتجاه: {data['direction']}
+السعر الحالي: {data['price']}
+RSI: {data['rsi']}
+MACD: {data['macd_desc']}
+موقع السعر في Bollinger: {data['bb_pct']} (0=أسفل، 1=أعلى)
+تغيير السعر آخر ساعة: {data['price_change_1h']}%
+تغيير السعر آخر 4 ساعات: {data['price_change_4h']}%
+ارتفاع الحجم: {'نعم 🔥' if data['vol_surge'] else 'لا'}
+عدد المؤشرات المتوافقة: {data['indicator_count']}/5
+EMA9: {data['ema9']} | EMA21: {data['ema21']} | EMA50: {data['ema50']}
 
-── إطار 15 دقيقة ──
-RSI: {sig["rsi"]} | Stoch: {sig["stoch_k"]} | MACD: {"تقاطع صاعد" if sig["cross_up"] else "تقاطع هابط" if sig["cross_down"] else "زخم صاعد" if sig["hist_bull"] else "زخم هابط"}
-EMA: {"Golden Cross ✅" if sig["golden"] else "Death Cross ❌" if sig["death"] else "مختلطة"}
-Bollinger: {int(sig["bb_pct"]*100)}%  |  حجم: {"مرتفع x"+str(sig["vol_ratio"]) if sig["vol_surge"] else "طبيعي"}
-التغير: 1س={sig["chg_1h"]}%  4س={sig["chg_4h"]}%  24س={sig["chg_24h"]}%
+أجب بـ JSON فقط بهذا الشكل بالضبط، بدون أي نص إضافي:
+{{"confidence": 75, "comment": "تعليق قصير بالعربي جملة واحدة فقط"}}
 
-── إطار ساعة ──
-RSI: {sig["rsi_1h"]} | EMA: {"Golden ✅" if sig["golden_1h"] else "Death ❌" if sig["death_1h"] else "مختلطة"} | حجم: {"مرتفع" if sig["vol_1h"] else "طبيعي"}
-
-── النقاط الفنية ──
-15m: {sig["score_15m"]}/20 | 1h: {sig["score_1h"]}/20
-
-قيّم الإشارة وأعط:
-- confidence: نسبة ثقتك 1-99 (كن صارماً — فوق 75 فقط إذا كانت قوية حقاً)
-- verdict: حكم واحد بالعربي (مثل: "قوية جداً" أو "جيدة مع مخاطرة" أو "متوسطة")
-- tip: نصيحة عملية قصيرة (جملة واحدة)
-
-أجب بـ JSON فقط:
-{{"confidence": 78, "verdict": "جيدة مع مخاطرة متوسطة", "tip": "انتظر تأكيد الشمعة الحالية قبل الدخول"}}"""
+نسبة الثقة من 1 إلى 99. كن صارماً ودقيقاً."""
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 150,
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=aiohttp.ClientTimeout(total=20)
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
                 resp = await r.json()
-        text = resp["content"][0]["text"].strip().replace("```json", "").replace("```", "")
+
+        text = resp['content'][0]['text'].strip()
+        if "```" in text:
+            text = text.split("```")[1].replace("json", "").strip()
         result = json.loads(text)
         return {
-            "confidence": max(1, min(99, int(result.get("confidence", 60)))),
-            "verdict":    result.get("verdict", ""),
-            "tip":        result.get("tip", "")
+            "confidence": max(1, min(99, int(result.get("confidence", 50)))),
+            "comment":    result.get("comment", "")
         }
     except Exception as e:
-        logger.error(f"خطأ AI إشارة: {e}")
-        conf = min(95, int(((sig["score_15m"] + sig["score_1h"]) / 26) * 100))
-        return {"confidence": conf, "verdict": "تحليل فني", "tip": ""}
+        logger.error(f"خطأ AI (fallback): {e}")
+        return _fallback_analysis(data)  # ✅ fallback تلقائي
 
 
-async def ai_deep_analysis(symbol: str, tf15: dict, tf1h: dict) -> str:
-    """تحليل احترافي عميق عند الطلب اليدوي"""
-    if not ANTHROPIC_API_KEY:
-        return "⚠️ مفتاح AI غير مفعّل — التحليل الفني متاح فقط"
+def _fallback_analysis(data: dict) -> dict:
+    """تحليل فني بديل بدون AI."""
+    score = data['tech_score']
+    # حساب الثقة بناءً على المؤشرات وقوة الإشارة
+    base = int((score / 5) * 100)
+    bonus = 0
+    if data.get('macd_cross_up') or data.get('macd_cross_down'):
+        bonus += 5
+    if data.get('vol_surge'):
+        bonus += 5
+    conf = min(95, max(50, base + bonus))
+    return {"confidence": conf, "comment": "تحليل فني متقدم"}
 
-    coin = symbol.replace("USDT", "")
-    prompt = f"""أنت كبير محللي التداول المتخصص في العملات الرقمية للعقود الآجلة.
-قدّم تحليلاً احترافياً شاملاً لـ {coin}/USDT.
 
-══ البيانات الفنية ══
-
-▌ إطار 15 دقيقة
-السعر: {tf15["price"]}
-RSI: {tf15["rsi"]} (سابق: {tf15["rsi_prev"]})
-Stochastic: {tf15["stoch_k"]}
-MACD: {"تقاطع صاعد 🚀" if tf15["cross_up"] else "تقاطع هابط 🔻" if tf15["cross_down"] else "زخم صاعد" if tf15["hist_bull"] else "زخم هابط" if tf15["hist_bear"] else "محايد"}
-EMA: 9={tf15["ema9"]} | 21={tf15["ema21"]} | 50={tf15["ema50"]}
-وضع EMA: {"Golden Cross ✅" if tf15["golden"] else "Death Cross ❌" if tf15["death"] else "مختلط"}
-Bollinger: {int(tf15["bb_pct"]*100)}% | أسفل={tf15["bb_low"]} | أعلى={tf15["bb_high"]}
-الحجم: {"ارتفاع x"+str(tf15["vol_ratio"])+" 🔥" if tf15["vol_surge"] else "طبيعي"}
-التغير: 1س={tf15["chg_1h"]}% | 4س={tf15["chg_4h"]}% | 24س={tf15["chg_24h"]}%
-
-▌ إطار ساعة
-RSI: {tf1h["rsi"]} | وضع EMA: {"Golden ✅" if tf1h["golden"] else "Death ❌" if tf1h["death"] else "مختلط"}
-Bollinger: {int(tf1h["bb_pct"]*100)}% | حجم: {"مرتفع" if tf1h["vol_surge"] else "طبيعي"}
-التغير 4س: {tf1h["chg_4h"]}% | 24س: {tf1h["chg_24h"]}%
-
-══ التحليل المطلوب ══
-قدّم تحليلاً بالعربي الفصيح يشمل:
-
-1. **خلاصة الوضع** — جملتان تصفان وضع العملة الآن
-2. **نقاط القوة** — ما يدعم الدخول (إن وُجدت)
-3. **نقاط الضعف** — المخاطر والعوامل السلبية
-4. **التوصية** — LONG أو SHORT أو انتظار، مع تبرير واضح
-5. **نقطة الدخول المثالية** — السعر والشرط
-6. **الأهداف المقترحة** — TP1 وTP2 وTP3 بناءً على ATR ({round(tf15["atr"], 8)})
-7. **وقف الخسارة** — ومبرره الفني
-8. **تنبيه خاص** — أي شيء يستوقفك في هذه العملة تحديداً
-
-اكتب بأسلوب محلل محترف — دقيق، مختصر، بلا حشو."""
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 800,
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as r:
-                resp = await r.json()
-        return resp["content"][0]["text"].strip()
-    except Exception as e:
-        logger.error(f"خطأ AI تحليل عميق: {e}")
-        return "⚠️ خطأ في الاتصال بـ AI"
-
-# ══════════════════════════════════════════════════════════════════
-#                  الأهداف ووقف الخسارة
-# ══════════════════════════════════════════════════════════════════
-def make_targets(price: float, direction: str, atr: float):
-    a = atr if atr > 0 else price * 0.02
-    if direction == "LONG":
-        sl   = round(price - a * 1.5, 8)
-        tps  = [round(price + a * m, 8) for m in [1.0, 2.2, 3.5, 5.5, 8.0]]
-        sl_p = f"-{round((price - sl) / price * 100, 1)}%"
-        pcts = [f"+{round((t - price) / price * 100, 1)}%" for t in tps]
+# ═══════════════════════════════════════════
+#     الأهداف ووقف الخسارة
+# ═══════════════════════════════════════════
+def make_targets(price: float, signal: str):
+    if signal == "LONG":
+        sl   = round(price * 0.985, 8)
+        tps  = [round(price * m, 8) for m in [1.005, 1.010, 1.015, 1.025, 1.040]]
+        pcts = ["+0.5%", "+1%", "+1.5%", "+2.5%", "+4%"]
+        sl_p = "-1.5%"
     else:
-        sl   = round(price + a * 1.5, 8)
-        tps  = [round(price - a * m, 8) for m in [1.0, 2.2, 3.5, 5.5, 8.0]]
-        sl_p = f"+{round((sl - price) / price * 100, 1)}%"
-        pcts = [f"-{round((price - t) / price * 100, 1)}%" for t in tps]
+        sl   = round(price * 1.015, 8)
+        tps  = [round(price * m, 8) for m in [0.995, 0.990, 0.985, 0.975, 0.960]]
+        pcts = ["-0.5%", "-1%", "-1.5%", "-2.5%", "-4%"]
+        sl_p = "+1.5%"
     return sl, tps, pcts, sl_p
 
-# ══════════════════════════════════════════════════════════════════
-#              تنسيق الرسائل (محترف)
-# ══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════
+#     تنسيق الرسائل
+# ═══════════════════════════════════════════
 def fmt(p: float) -> str:
-    if p >= 1:      return f"{p:,.4f}$"
-    elif p >= 0.01: return f"{p:.6f}$"
-    else:           return f"{p:.8f}$"
+    if p >= 1:       return f"{p:,.4f}$"
+    elif p >= 0.01:  return f"{p:.6f}$"
+    else:            return f"{p:.8f}$"
 
-def signal_message(symbol: str, sig: dict, ai: dict, sl, tps, pcts, sl_p) -> str:
+
+def build_message(symbol, tech, ai, sl, tps, pcts, sl_p):
     coin   = symbol.replace("USDT", "")
-    now    = datetime.utcnow().strftime("%d/%m/%Y  %H:%M UTC")
-    conf   = ai["confidence"]
-    is_long = sig["direction"] == "LONG"
+    now    = datetime.utcnow().strftime("%d.%m.%Y %H:%M:%S UTC+0")
+    price  = tech['price']
+    signal = tech['direction']
+    conf   = ai['confidence']
 
-    # مستوى الإشارة
-    if conf >= 85:
-        level = "🔥 إشارة قوية جداً"
-        stars = "★★★★★"
-    elif conf >= 75:
-        level = "✅ إشارة جيدة"
-        stars = "★★★★☆"
-    else:
-        level = "📊 إشارة متوسطة"
-        stars = "★★★☆☆"
+    emoji  = "🟢🟢🟢" if signal == "LONG" else "🔴🔴🔴"
+    action = "لونغ" if signal == "LONG" else "شورت"
 
-    bar = "█" * int(conf / 10) + "░" * (10 - int(conf / 10))
+    if conf >= 85:   stars = "⭐⭐⭐⭐⭐"
+    elif conf >= 75: stars = "⭐⭐⭐⭐"
+    elif conf >= 70: stars = "⭐⭐⭐"
+    else:            stars = "⭐⭐"
 
-    ema_txt = "Golden Cross ✅" if sig["golden"] else "Death Cross ❌" if sig["death"] else "مختلطة"
-    ema_1h  = "Golden ✅" if sig["golden_1h"] else "Death ❌" if sig["death_1h"] else "مختلطة"
-    vol_txt = f"🔥 مرتفع ×{sig['vol_ratio']}" if sig["vol_surge"] else "طبيعي"
+    filled = int(conf / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
 
-    return f"""
-╔══════════════════════════════╗
-║  {'📈 لونغ' if is_long else '📉 شورت'}  {coin}/USDT  {'🟢' if is_long else '🔴'}   ║
-╚══════════════════════════════╝
-{level}  {stars}
+    ai_line = f"\n🤖 AI: {ai['comment']}\n" if ai['comment'] else ""
 
-🕐 {now}
-💰 الدخول:  {fmt(sig['price'])}
+    extras = ""
+    if tech['vol_surge']:
+        extras += "📊 الحجم: ارتفاع مفاجئ 🔥\n"
 
-🤖 تقييم AI:  {ai['verdict']}
-💡 {ai['tip']}
+    indicators_count = tech.get('indicator_count', 0)
 
-┌─ الثقة ──────────────────────
-│  {conf}%  [{bar}]
-└───────────────────────────────
-
-┌─ الأهداف ─────────────────────
-│  🎯 TP1   {fmt(tps[0])}   ({pcts[0]})
-│  🎯 TP2   {fmt(tps[1])}   ({pcts[1]})
-│  🎯 TP3   {fmt(tps[2])}   ({pcts[2]})
-│  🎯 TP4   {fmt(tps[3])}   ({pcts[3]})
-│  🎯 TP5   {fmt(tps[4])}   ({pcts[4]})
-└───────────────────────────────
-🛑 وقف الخسارة:  {fmt(sl)}   ({sl_p})
-
-┌─ المؤشرات ────────────────────
-│  15m │ RSI {sig['rsi']}  Stoch {sig['stoch_k']}
-│      │ EMA: {ema_txt}
-│      │ Bollinger: {int(sig['bb_pct']*100)}%
-│      │ الحجم: {vol_txt}
-│   1h │ RSI {sig['rsi_1h']}  EMA: {ema_1h}
-└───────────────────────────────
-📊 التغير:  1س {sig['chg_1h']:+}%  ·  4س {sig['chg_4h']:+}%  ·  24س {sig['chg_24h']:+}%
-⚙️ نقاط فنية:  15m {sig['score_15m']}/20  ·  1h {sig['score_1h']}/20
-
-⚠️  للتأكيد فقط — القرار مسؤوليتك
-🏦  Bitunix Futures
-""".strip()
+    return (
+        f"تحديث: {now}\n"
+        f"{emoji} {coin}/USDT  {action}  {emoji}\n\n"
+        f"➡️ نقطة الدخول: {fmt(price)}\n"
+        f"{ai_line}\n"
+        f"💯 نسبة الثقة: {conf}%\n"
+        f"[{bar}]\n"
+        f"{stars}\n"
+        f"📡 المؤشرات المتوافقة: {indicators_count}/5\n\n"
+        f"🎯 TP1: {fmt(tps[0])}  ({pcts[0]})\n"
+        f"🎯 TP2: {fmt(tps[1])}  ({pcts[1]})\n"
+        f"🎯 TP3: {fmt(tps[2])}  ({pcts[2]})\n"
+        f"🎯 TP4: {fmt(tps[3])}  ({pcts[3]})\n"
+        f"🎯 TP5 (إغلاق): {fmt(tps[4])}  ({pcts[4]})\n\n"
+        f"🛑 SL: {fmt(sl)}  ({sl_p})\n\n"
+        f"📊 RSI: {tech['rsi']}\n"
+        f"📈 MACD: {tech['macd_desc']}\n"
+        f"{extras}"
+        f"⚠️ التثبيت حسب تقديرك، آخر TP يغلق الباقي.\n"
+        f"🏦 Bitunix Futures"
+    )
 
 
-def analysis_header(symbol: str, price: float, tf15: dict, tf1h: dict) -> str:
-    """رأس رسالة التحليل اليدوي"""
-    coin = symbol.replace("USDT", "")
-    now  = datetime.utcnow().strftime("%d/%m/%Y  %H:%M UTC")
-    return f"""
-╔══════════════════════════════╗
-║  🔍 تحليل احترافي            ║
-║  {coin}/USDT                  
-╚══════════════════════════════╝
-🕐 {now}
-💰 السعر الحالي:  {fmt(price)}
-📊 التغير:  1س {tf15['chg_1h']:+}%  ·  4س {tf15['chg_4h']:+}%  ·  24س {tf15['chg_24h']:+}%
+# ═══════════════════════════════════════════
+#     ✅ جديد: رسالة تحليل العملة عند الطلب
+# ═══════════════════════════════════════════
+def build_analysis_message(symbol: str, tech: dict, ai: dict) -> str:
+    coin  = symbol.replace("USDT", "")
+    conf  = ai['confidence']
+    price = tech['price']
 
-──────────────────────────────
-""".strip()
+    direction_ar = "📈 صاعدة" if tech['direction'] == "LONG" else "📉 هابطة"
 
-# ══════════════════════════════════════════════════════════════════
-#                   الفحص التلقائي
-# ══════════════════════════════════════════════════════════════════
-async def scan_market(bot: Bot) -> int:
+    if conf >= 85:   stars = "⭐⭐⭐⭐⭐"
+    elif conf >= 75: stars = "⭐⭐⭐⭐"
+    elif conf >= 70: stars = "⭐⭐⭐"
+    else:            stars = "⭐⭐"
+
+    rsi_status  = f"{'✅' if tech['rsi_ok'] else '❌'}  {tech['rsi']} — {'منطقة شراء' if tech['rsi'] < 45 else 'منطقة بيع' if tech['rsi'] > 55 else 'محايد'}"
+    macd_status = f"{'✅' if tech['macd_ok'] else '❌'}  {tech['macd_desc']}"
+    ema_status  = f"{'✅' if tech['ema_ok'] else '❌'}  EMA9={tech['ema9']} | EMA21={tech['ema21']}"
+    vol_status  = f"{'✅' if tech['vol_ok'] else '❌'}  {'ارتفاع مفاجئ 🔥' if tech['vol_surge'] else 'حجم عادي'}"
+    bb_status   = f"{'✅' if tech['bb_ok'] else '❌'}  موقع السعر في البولنجر: {tech['bb_pct']:.0%}"
+
+    rec = ""
+    if conf >= 70 and tech['direction'] == "LONG":
+        sl, tps, pcts, sl_p = make_targets(price, "LONG")
+        rec = (
+            f"\n💡 توصية الدخول:\n"
+            f"  ➡️ دخول: {fmt(price)}\n"
+            f"  🎯 TP1: {fmt(tps[0])} ({pcts[0]})\n"
+            f"  🎯 TP2: {fmt(tps[1])} ({pcts[1]})\n"
+            f"  🎯 TP3: {fmt(tps[2])} ({pcts[2]})\n"
+            f"  🛑 SL:  {fmt(sl)} ({sl_p})\n"
+        )
+    elif conf >= 70 and tech['direction'] == "SHORT":
+        sl, tps, pcts, sl_p = make_targets(price, "SHORT")
+        rec = (
+            f"\n💡 توصية الدخول:\n"
+            f"  ➡️ دخول: {fmt(price)}\n"
+            f"  🎯 TP1: {fmt(tps[0])} ({pcts[0]})\n"
+            f"  🎯 TP2: {fmt(tps[1])} ({pcts[1]})\n"
+            f"  🎯 TP3: {fmt(tps[2])} ({pcts[2]})\n"
+            f"  🛑 SL:  {fmt(sl)} ({sl_p})\n"
+        )
+
+    ai_line = f"🤖 AI: {ai['comment']}\n" if ai.get('comment') else ""
+
+    return (
+        f"🔎 تحليل العملة عند الطلب\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 العملة: {coin}/USDT\n"
+        f"💰 السعر الحالي: {fmt(price)}\n"
+        f"📊 الاتجاه: {direction_ar}\n"
+        f"💯 نسبة الثقة: {conf}%  {stars}\n"
+        f"{ai_line}"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧪 الأسباب:\n"
+        f"  📌 RSI:    {rsi_status}\n"
+        f"  📌 MACD:   {macd_status}\n"
+        f"  📌 EMA:    {ema_status}\n"
+        f"  📌 حجم:    {vol_status}\n"
+        f"  📌 BB:     {bb_status}\n"
+        f"  📡 توافق: {tech['indicator_count']}/5 مؤشرات\n"
+        f"{rec}"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ للمعلومات فقط، القرار لك.\n"
+        f"🏦 Bitunix Futures"
+    )
+
+
+# ═══════════════════════════════════════════
+#     الفحص التلقائي — ✅ مع كل الفلاتر الجديدة
+# ═══════════════════════════════════════════
+async def scan_market(bot: Bot):
+    global last_signal_time
+
+    if not check_daily_limit():
+        logger.info(f"⛔ وصلنا للحد اليومي ({DAILY_MAX} إشارة)")
+        return
+
     logger.info("🔍 بدأ الفحص...")
     symbols = await get_symbols()
     found   = 0
 
     for sym in symbols:
-        if found >= MAX_PER_SCAN:
+        if not check_daily_limit():
             break
+
         try:
-            df15 = await get_klines(sym, "15m", 200)
-            df1h = await get_klines(sym, "1h",  100)
-            if df15 is None or df1h is None:
-                await asyncio.sleep(0.3)
+            df = await get_klines(sym)
+            if df is None or len(df) < 50:
+                await asyncio.sleep(0.2)
                 continue
 
-            tf15 = analyze_timeframe(df15)
-            tf1h = analyze_timeframe(df1h)
-            if not tf15 or not tf1h:
-                await asyncio.sleep(0.3)
+            tech = technical_analysis(df)
+            if not tech:
+                await asyncio.sleep(0.2)
                 continue
 
-            sig = strict_signal(tf15, tf1h)
-            if not sig:
-                await asyncio.sleep(0.3)
+            key      = f"{sym}_{tech['direction']}"
+            now_time = asyncio.get_event_loop().time()
+
+            # ✅ فلتر cooldown لنفس العملة
+            if now_time - sent_signals.get(key, 0) < SIGNAL_COOLDOWN:
+                await asyncio.sleep(0.1)
                 continue
 
-            key = f"{sym}_{sig['direction']}"
-            if is_on_cooldown(key):
-                await asyncio.sleep(0.3)
+            # ✅ فلتر global cooldown (منع إرسال إشارتين متقاربتين)
+            if now_time - last_signal_time < GLOBAL_COOLDOWN:
+                await asyncio.sleep(0.1)
                 continue
 
-            price = sig["price"]
+            price = tech['price']
             if price >= MAX_PRICE or price <= 0:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 continue
 
-            ai = await ai_signal_review(sym, sig)
+            # ✅ AI فقط للعملات القوية
+            ai = await ai_analysis(sym, tech)
 
-            # ★ فقط الإشارات فوق 70%
-            if ai["confidence"] < 70:
-                logger.info(f"⏭ {sym} {sig['direction']} {ai['confidence']}% — ثقة منخفضة")
-                await asyncio.sleep(0.3)
+            if ai['confidence'] < MIN_CONFIDENCE:
+                await asyncio.sleep(0.2)
                 continue
 
-            sl, tps, pcts, sl_p = make_targets(price, sig["direction"], sig["atr"])
-            msg = signal_message(sym, sig, ai, sl, tps, pcts, sl_p)
+            sl, tps, pcts, sl_p = make_targets(price, tech['direction'])
+            msg = build_message(sym, tech, ai, sl, tps, pcts, sl_p)
 
             await bot.send_message(chat_id=CHAT_ID, text=msg)
-            record_signal(key)
+            sent_signals[key] = now_time
+            last_signal_time   = now_time
+            increment_daily()
             found += 1
-            logger.info(f"📤 {sym} {sig['direction']} {ai['confidence']}%")
+            logger.info(f"📤 {sym} {tech['direction']} {ai['confidence']}% (يوم: {daily_count}/{DAILY_MAX})")
             await asyncio.sleep(2)
 
         except Exception as e:
             logger.error(f"خطأ {sym}: {e}")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
-    logger.info(f"✅ انتهى — {found} إشارة من {len(symbols)} عملة")
-    return found
+    logger.info(f"✅ انتهى — {found} إشارة جديدة | إجمالي اليوم: {daily_count}/{DAILY_MAX}")
 
-# ══════════════════════════════════════════════════════════════════
-#              تحليل عملة بالطلب (يدوي — عميق)
-# ══════════════════════════════════════════════════════════════════
-async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().upper()
-    symbol = text.replace("/", "").replace("-", "").replace(" ", "")
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
 
-    msg = await update.message.reply_text(f"⏳ جاري تحليل {symbol} ...\nهذا يأخذ ثوانٍ قليلة")
-
-    df15 = await get_klines(symbol, "15m", 200)
-    df1h = await get_klines(symbol, "1h",  100)
-
-    if df15 is None or df1h is None:
-        await msg.edit_text(
-            f"❌ تعذّر جلب بيانات {symbol}\n\n"
-            f"تحقق من الاسم — أمثلة:\n"
-            f"XRP  ·  DOGE  ·  ADA  ·  XRPUSDT"
-        )
-        return
-
-    tf15 = analyze_timeframe(df15)
-    tf1h = analyze_timeframe(df1h)
-
-    if not tf15 or not tf1h:
-        await msg.edit_text(f"⚠️ {symbol}\nبيانات غير كافية للتحليل")
-        return
-
-    price = tf15["price"]
-
-    # رأس الرسالة بالأرقام
-    header = analysis_header(symbol, price, tf15, tf1h)
-    await msg.edit_text(f"{header}\n\n🤖 AI يحلل...")
-
-    # التحليل العميق
-    deep = await ai_deep_analysis(symbol, tf15, tf1h)
-
-    final = f"{header}\n\n{deep}"
-    # تيليغرام حد الرسالة 4096 حرف
-    if len(final) > 4090:
-        await msg.edit_text(header)
-        await update.message.reply_text(deep)
-    else:
-        await msg.edit_text(final)
-
-# ══════════════════════════════════════════════════════════════════
-#                     أوامر التلغرام
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════
+#     أوامر التلغرام
+# ═══════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     syms = await get_symbols()
-    ai_s = "✅ Claude Sonnet" if ANTHROPIC_API_KEY else "❌ غير مفعّل"
-    await update.message.reply_text(f"""
-╔══════════════════════════════╗
-║   🌟 سراب للإشارات v3.0     ║
-╚══════════════════════════════╝
+    ai_status = "✅ مفعّل" if ANTHROPIC_API_KEY else "⚡ تحليل فني (بدون AI)"
+    await update.message.reply_text(
+        f"🌟 مرحباً بك في سراب للإشارات! 🌟\n\n"
+        f"📡 يراقب {len(syms)} عملة (تحت $10)\n"
+        f"⏱ فحص تلقائي كل 3 دقائق\n"
+        f"🤖 تحليل AI: {ai_status}\n"
+        f"💯 حد الثقة الأدنى: 70%\n"
+        f"📊 RSI + MACD + EMA + Bollinger + Volume\n"
+        f"🎯 الحد اليومي: {DAILY_MAX} إشارة عالية الجودة\n"
+        f"🔄 لونغ وشورت\n\n"
+        f"الأوامر:\n"
+        f"/scan — فحص فوري\n"
+        f"/status — حالة البوت\n"
+        f"🔎 أرسل اسم عملة (مثل XRPUSDT) لتحليلها فوراً"
+    )
 
-📡 يراقب {len(syms)} عملة (تحت $10)
-⏱  فحص كل 7 دقايق
-🤖 AI: {ai_s}
-✅ تأكيد من إطارين زمنيين (15m + 1h)
-💯 ثقة 70%+ فقط تعبر
-🎯 أهداف ديناميكية بالـ ATR
-🔒 Cooldown 4 ساعات (دائم)
-📈 أقصى إشارتين بكل فحص
-
-──────────────────────────────
-الأوامر:
-/scan    — فحص فوري
-/status  — حالة البوت
-/clear   — مسح سجل الإشارات
-
-💡 تحليل عملة:
-ابعت اسمها مباشرة مثل:
-  XRP  ·  DOGE  ·  SOL  ·  BTC
-وسأقدم تحليلاً احترافياً شاملاً
-""".strip())
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 جاري فحص السوق...")
-    found = await scan_market(context.bot)
-    await update.message.reply_text(
-        f"✅ انتهى الفحص\n📤 إشارات مرسلة: {found}"
-    )
+    await update.message.reply_text("🔍 جاري الفحص، انتظر قليلاً...")
+    await scan_market(context.bot)
+    await update.message.reply_text(f"✅ انتهى الفحص! إشارات اليوم: {daily_count}/{DAILY_MAX}")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    syms     = await get_symbols()
-    signals  = load_signals()
-    ai_s     = "✅ Claude Sonnet" if ANTHROPIC_API_KEY else "❌ غير مفعّل"
-    active   = sum(1 for t in signals.values() if (datetime.utcnow() - t).total_seconds() < SIGNAL_COOLDOWN)
-    await update.message.reply_text(f"""
-✅ سراب يعمل بشكل طبيعي
-
-⏱  الفحص كل: 7 دقايق
-📊 العملات: {len(syms)}
-🤖 AI: {ai_s}
-💯 الحد الأدنى للثقة: 70%
-⚙️  الحد الأدنى للنقاط: 8/20 (15m) + 5/20 (1h)
-📤 إشارات نشطة (في 4 ساعات): {active}
-📁 إجمالي السجل: {len(signals)}
-""".strip())
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    signals = load_signals()
-    count   = len(signals)
-    save_signals({})
+    syms = await get_symbols()
+    ai_status = "✅ مفعّل" if ANTHROPIC_API_KEY else "⚡ تحليل فني"
     await update.message.reply_text(
-        f"🗑️ تم مسح سجل {count} إشارة\n✅ البوت جاهز للفحص من جديد"
+        f"✅ سراب يعمل بشكل طبيعي\n\n"
+        f"⏱ الفحص كل: 3 دقائق\n"
+        f"📊 العملات: {len(syms)}\n"
+        f"💰 الحد الأقصى: $10\n"
+        f"💯 حد الثقة: 70%+\n"
+        f"📡 الإشارات اليوم: {daily_count}/{DAILY_MAX}\n"
+        f"🤖 AI: {ai_status}"
     )
+
+
+# ═══════════════════════════════════════════
+#     ✅ جديد: تحليل عملة عند الطلب
+# ═══════════════════════════════════════════
+async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يستقبل اسم عملة ويحللها فوراً."""
+    text   = update.message.text.strip().upper()
+    symbol = text if text.endswith("USDT") else f"{text}USDT"
+
+    await update.message.reply_text(f"🔎 جاري تحليل {symbol}، لحظة...")
+
+    try:
+        # نستخدم 5m للتحليل الفوري
+        df = await get_klines(symbol, interval="5m", limit=200)
+        if df is None or len(df) < 50:
+            await update.message.reply_text(
+                f"⚠️ لم أتمكن من جلب بيانات {symbol}.\n"
+                f"تأكد من اسم العملة (مثال: XRP أو XRPUSDT)."
+            )
+            return
+
+        tech = technical_analysis(df)
+
+        if not tech:
+            price = df['close'].iloc[-1]
+            await update.message.reply_text(
+                f"📊 {symbol}\n"
+                f"💰 السعر: {fmt(price)}\n\n"
+                f"⚠️ لا يوجد اتجاه واضح حالياً.\n"
+                f"السوق في تذبذب أو المؤشرات متضاربة.\n"
+                f"يُنصح بالانتظار لاتجاه أوضح."
+            )
+            return
+
+        ai = await ai_analysis(symbol, tech)
+        msg = build_analysis_message(symbol, tech, ai)
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        logger.error(f"خطأ تحليل {symbol}: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ أثناء تحليل {symbol}. حاول مرة أخرى.")
+
 
 async def auto_scan(context: ContextTypes.DEFAULT_TYPE):
     await scan_market(context.bot)
 
-# ══════════════════════════════════════════════════════════════════
-#                      تشغيل البوت
-# ══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════
+#     تشغيل البوت
+# ═══════════════════════════════════════════
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("clear",  cmd_clear))
 
-    # أي رسالة نصية = اسم عملة للتحليل
+    # ✅ Handler لتحليل العملات عند الطلب (أي رسالة نصية عادية)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coin_request))
 
-    app.job_queue.run_repeating(auto_scan, interval=CHECK_INTERVAL, first=30)
+    app.job_queue.run_repeating(auto_scan, interval=CHECK_INTERVAL, first=20)
 
-    logger.info("🚀 سراب v3.0 يعمل...")
+    logger.info("🚀 سراب للإشارات يعمل — جودة عالية فقط!")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

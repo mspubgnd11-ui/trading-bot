@@ -439,35 +439,23 @@ def _fallback_analysis(data: dict) -> dict:
 #     الأهداف الاحترافية — مع ATR
 # ═══════════════════════════════════════════
 def make_targets(price: float, signal: str, atr: float = None):
-    """أهداف ديناميكية بناءً على ATR إذا متوفر."""
-    if atr and atr > 0:
-        # استخدام ATR لأهداف أكثر دقة
-        atr_ratio = atr / price
-        m1 = 1 + (atr_ratio * 0.8)
-        m2 = 1 + (atr_ratio * 1.5)
-        m3 = 1 + (atr_ratio * 2.2)
-        m4 = 1 + (atr_ratio * 3.5)
-        m5 = 1 + (atr_ratio * 5.5)
-        sl_m = 1 - (atr_ratio * 1.5)
-    else:
-        m1, m2, m3, m4, m5 = 1.005, 1.010, 1.015, 1.025, 1.040
-        sl_m = 0.985
+    """أهداف احترافية كبيرة — TP5 يصل +40% و SL -4.5%"""
+    # نسب ثابتة كبيرة واحترافية
+    LONG_MULTS = [1.016, 1.048, 1.08, 1.14, 1.40]
+    SHORT_MULTS = [0.984, 0.952, 0.920, 0.860, 0.600]
+    LONG_SL_M  = 0.955   # -4.5%
+    SHORT_SL_M = 1.045   # +4.5%
 
     if signal == "LONG":
-        sl   = round(price * sl_m, 8)
-        tps  = [round(price * m, 8) for m in [m1, m2, m3, m4, m5]]
-        pcts = [f"+{round((m1-1)*100,1)}%", f"+{round((m2-1)*100,1)}%",
-                f"+{round((m3-1)*100,1)}%", f"+{round((m4-1)*100,1)}%",
-                f"+{round((m5-1)*100,1)}%"]
-        sl_p = f"-{round((1-sl_m)*100,1)}%"
+        sl   = round(price * LONG_SL_M, 8)
+        tps  = [round(price * m, 8) for m in LONG_MULTS]
+        pcts = [f"+{round((m-1)*100,1)}%" for m in LONG_MULTS]
+        sl_p = f"-{round((1-LONG_SL_M)*100,1)}%"
     else:
-        inv_sl_m = 2 - sl_m
-        sl   = round(price * inv_sl_m, 8)
-        tps  = [round(price * (2-m), 8) for m in [m1, m2, m3, m4, m5]]
-        pcts = [f"-{round((m1-1)*100,1)}%", f"-{round((m2-1)*100,1)}%",
-                f"-{round((m3-1)*100,1)}%", f"-{round((m4-1)*100,1)}%",
-                f"-{round((m5-1)*100,1)}%"]
-        sl_p = f"+{round((1-sl_m)*100,1)}%"
+        sl   = round(price * SHORT_SL_M, 8)
+        tps  = [round(price * m, 8) for m in SHORT_MULTS]
+        pcts = [f"-{round((1-m)*100,1)}%" for m in SHORT_MULTS]
+        sl_p = f"+{round((SHORT_SL_M-1)*100,1)}%"
 
     return sl, tps, pcts, sl_p
 
@@ -747,6 +735,16 @@ async def scan_market(bot: Bot):
                 await asyncio.sleep(0.2)
                 continue
 
+            # ✅ سحب السعر اللحظي قبل الإرسال مباشرة لمنع فرق السعر
+            live_price = await get_current_price(sym)
+            if live_price and live_price > 0:
+                tech['price'] = live_price
+                price = live_price
+
+            if price >= MAX_PRICE or price <= 0:
+                await asyncio.sleep(0.2)
+                continue
+
             atr = tech.get('atr')
             sl, tps, pcts, sl_p = make_targets(price, tech['direction'], atr)
             msg = build_signal_message(sym, tech, ai, sl, tps, pcts, sl_p)
@@ -849,6 +847,11 @@ async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # ✅ تحليل خفيف — يرجع دائماً نتيجة
         tech = technical_analysis_light(df)
+
+        # ✅ سحب السعر اللحظي قبل إرسال التحليل
+        live_price = await get_current_price(symbol)
+        if live_price and live_price > 0:
+            tech['price'] = live_price
 
         # ✅ AI تفصيلي يحدد الاتجاه الحقيقي
         ai = await ai_analysis_detailed(symbol, tech)

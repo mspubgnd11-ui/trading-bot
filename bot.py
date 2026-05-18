@@ -18,25 +18,28 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 TIMEFRAME = "15m"
 MAX_PRICE = 10
-SCAN_LIMIT = 120
-COOLDOWN = 1800  # 30 دقيقة
+SCAN_LIMIT = 100
+COOLDOWN = 1800
 
 EXCLUDED = ["BTC", "ETH"]
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-session = None
 bot = None
 sent = {}
 
 # ======================
-# HTTP
+# SAFE HTTP (NO SESSION PROBLEMS)
 # ======================
 
 async def fetch(url, params=None):
-    async with session.get(url, params=params, timeout=10) as r:
-        return await r.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as r:
+                return await r.json()
+    except:
+        return None
 
 # ======================
 # SYMBOLS
@@ -46,12 +49,12 @@ async def get_symbols():
     url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
     data = await fetch(url)
 
-    if data.get("code") != 0:
+    if not data or data.get("code") != 0:
         return []
 
     symbols = []
 
-    for t in data["data"]:
+    for t in data.get("data", []):
         sym = t.get("symbol", "")
         price = float(t.get("lastPrice", 0))
 
@@ -78,18 +81,21 @@ async def get_klines(symbol):
 
     data = await fetch(url, params)
 
-    if data.get("code") != 0:
+    if not data or "data" not in data or not data["data"]:
         return None
 
-    df = pd.DataFrame(data["data"])
+    try:
+        df = pd.DataFrame(data["data"])
 
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = df[c].astype(float)
 
-    return df
+        return df
+    except:
+        return None
 
 # ======================
-# ANALYSIS + CONFIDENCE
+# ANALYSIS (SMART BUT LIGHT)
 # ======================
 
 def analyze(df):
@@ -109,19 +115,16 @@ def analyze(df):
     long_score = 0
     short_score = 0
 
-    # RSI
     if rsi < 55:
         long_score += 1
     if rsi > 45:
         short_score += 1
 
-    # MACD (وزن قوي)
     if macd_line > macd_signal:
         long_score += 2
     else:
         short_score += 2
 
-    # Trend
     if price > ema20:
         long_score += 1
     else:
@@ -132,7 +135,6 @@ def analyze(df):
     else:
         short_score += 1
 
-    # فلتر السوق الهادئ
     volatility = abs(price - ema20) / price
     if volatility < 0.001:
         return None, price, rsi, 0
@@ -156,22 +158,10 @@ def analyze(df):
 def targets(price, side):
     if side == "LONG":
         sl = price * 0.98
-        tps = [
-            price * 1.01,
-            price * 1.02,
-            price * 1.04,
-            price * 1.06,
-            price * 1.10
-        ]
+        tps = [price * 1.01, price * 1.02, price * 1.04, price * 1.06, price * 1.10]
     else:
         sl = price * 1.02
-        tps = [
-            price * 0.99,
-            price * 0.98,
-            price * 0.96,
-            price * 0.94,
-            price * 0.90
-        ]
+        tps = [price * 0.99, price * 0.98, price * 0.96, price * 0.94, price * 0.90]
 
     return sl, tps
 
@@ -232,51 +222,48 @@ async def process(symbol):
 
         sent[key] = now
 
-    except Exception as e:
-        log.error(e)
+    except:
+        pass
 
 # ======================
-# SCAN
+# SCAN LOOP (SAFE)
 # ======================
 
 async def scan():
-    log.info("Scanning market...")
-
     symbols = await get_symbols()
-
     tasks = [process(s) for s in symbols]
-
     await asyncio.gather(*tasks)
+
+# ======================
+# LOOP (NO CRASH)
+# ======================
+
+async def auto_loop():
+    while True:
+        try:
+            await scan()
+        except:
+            pass
+        await asyncio.sleep(300)
 
 # ======================
 # COMMANDS
 # ======================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔥 البوت شغال وجاهز للإشارات")
+    await update.message.reply_text("🔥 البوت شغال وجاهز")
 
 async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 جاري الفحص...")
     await scan()
-    await update.message.reply_text("✅ تم الفحص")
+    await update.message.reply_text("✅ انتهى")
 
 # ======================
-# LOOP
+# MAIN (RAILWAY SAFE)
 # ======================
 
-async def auto_loop():
-    while True:
-        await scan()
-        await asyncio.sleep(300)
-
-# ======================
-# MAIN
-# ======================
-
-async def main():
-    global session, bot
-
-    session = aiohttp.ClientSession()
+def main():
+    global bot
 
     app = Application.builder().token(TOKEN).build()
     bot = app.bot
@@ -287,7 +274,7 @@ async def main():
     asyncio.create_task(auto_loop())
 
     print("Bot running...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

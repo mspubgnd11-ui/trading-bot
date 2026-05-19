@@ -18,16 +18,16 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID           = os.getenv("CHAT_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-CHECK_INTERVAL    = 180
-MAX_PRICE         = 10.0
-MAX_SYMBOLS       = 150
-MIN_CONFIDENCE    = 70
-MIN_INDICATORS    = 3
-SIGNAL_COOLDOWN   = 3600
-GLOBAL_COOLDOWN   = 120
-DAILY_MAX         = 15
-TREND_MIN_SLOPE   = 0.0003
-PRICE_CHECK_INTERVAL = 60  # فحص الأسعار كل دقيقة لتحديث الأهداف
+CHECK_INTERVAL       = 180
+MAX_PRICE            = 10.0
+MAX_SYMBOLS          = 150
+MIN_CONFIDENCE       = 70
+MIN_INDICATORS       = 3
+SIGNAL_COOLDOWN      = 3600
+GLOBAL_COOLDOWN      = 120
+DAILY_MAX            = 15
+TREND_MIN_SLOPE      = 0.0003
+PRICE_CHECK_INTERVAL = 60
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,14 +35,11 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════
 #     متتبع الإشارات والأهداف
 # ═══════════════════════════════════════════
-sent_signals:     dict  = {}   # {key: timestamp}
+sent_signals:     dict  = {}
 daily_count:      int   = 0
 daily_reset_date: date  = date.today()
 last_signal_time: float = 0.0
-
-# تتبع الرسائل المرسلة لتحديث الأهداف
-# {message_id: {symbol, direction, price, tps, sl, tp_hit: [F,F,F,F,F], sl_hit: F, chat_id, text}}
-active_trades: dict = {}
+active_trades:    dict  = {}
 
 
 def check_daily_limit() -> bool:
@@ -60,7 +57,7 @@ def increment_daily():
 
 
 # ═══════════════════════════════════════════
-#     سحب العملات
+#     سحب العملات من Bitunix
 # ═══════════════════════════════════════════
 async def get_symbols():
     url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
@@ -84,7 +81,7 @@ async def get_symbols():
 
 
 # ═══════════════════════════════════════════
-#     سحب السعر الحالي فقط (للتتبع)
+#     سحب السعر اللحظي
 # ═══════════════════════════════════════════
 async def get_current_price(symbol: str) -> float | None:
     url = "https://fapi.bitunix.com/api/v1/futures/market/tickers"
@@ -101,9 +98,9 @@ async def get_current_price(symbol: str) -> float | None:
 
 
 # ═══════════════════════════════════════════
-#     سحب الشمعدانات — 5m
+#     سحب الشمعدانات — 15m
 # ═══════════════════════════════════════════
-async def get_klines(symbol: str, interval="5m", limit=200):
+async def get_klines(symbol: str, interval="15m", limit=200):
     url = "https://fapi.bitunix.com/api/v1/futures/market/kline"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -128,7 +125,7 @@ async def get_klines(symbol: str, interval="5m", limit=200):
 
 
 # ═══════════════════════════════════════════
-#     التحليل الفني الكامل — للإشارات التلقائية
+#     التحليل الفني — للإشارات التلقائية
 # ═══════════════════════════════════════════
 def technical_analysis(df: pd.DataFrame):
     if len(df) < 50:
@@ -165,8 +162,9 @@ def technical_analysis(df: pd.DataFrame):
 
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
 
-    price_change_1h = round(((price - close.iloc[-12]) / (close.iloc[-12] + 1e-10)) * 100, 2)
-    price_change_4h = round(((price - close.iloc[-48]) / (close.iloc[-48] + 1e-10)) * 100, 2)
+    # للشمعة 15 دقيقة: آخر ساعة = 4 شمعات، آخر 4 ساعات = 16 شمعة
+    price_change_1h = round(((price - close.iloc[-4])  / (close.iloc[-4]  + 1e-10)) * 100, 2)
+    price_change_4h = round(((price - close.iloc[-16]) / (close.iloc[-16] + 1e-10)) * 100, 2)
 
     rsi_long  = rsi_val < 45
     rsi_short = rsi_val > 55
@@ -187,16 +185,16 @@ def technical_analysis(df: pd.DataFrame):
     has_uptrend   = slope > TREND_MIN_SLOPE
     has_downtrend = slope < -TREND_MIN_SLOPE
 
-    if (long_indicators >= MIN_INDICATORS and long_indicators > short_indicators and has_uptrend):
+    if long_indicators >= MIN_INDICATORS and long_indicators > short_indicators and has_uptrend:
         direction = "LONG"
         score = long_indicators
-    elif (short_indicators >= MIN_INDICATORS and short_indicators > long_indicators and has_downtrend):
+    elif short_indicators >= MIN_INDICATORS and short_indicators > long_indicators and has_downtrend:
         direction = "SHORT"
         score = short_indicators
     else:
         return None
 
-    if macd_cross_up:    macd_desc = "تقاطع صاعد 🚀"
+    if macd_cross_up:     macd_desc = "تقاطع صاعد 🚀"
     elif macd_cross_down: macd_desc = "تقاطع هابط 🔻"
     elif macd_bull:       macd_desc = "صاعد 📈"
     else:                 macd_desc = "هابط 📉"
@@ -218,16 +216,16 @@ def technical_analysis(df: pd.DataFrame):
         "ema50":           round(ema50, 6),
         "price_change_1h": price_change_1h,
         "price_change_4h": price_change_4h,
-        "rsi_ok":  rsi_long if direction=="LONG" else rsi_short,
-        "macd_ok": macd_long if direction=="LONG" else macd_short,
-        "ema_ok":  ema_long  if direction=="LONG" else ema_short,
-        "bb_ok":   bb_long   if direction=="LONG" else bb_short,
-        "vol_ok":  vol_long  if direction=="LONG" else vol_short,
+        "rsi_ok":  rsi_long  if direction == "LONG" else rsi_short,
+        "macd_ok": macd_long if direction == "LONG" else macd_short,
+        "ema_ok":  ema_long  if direction == "LONG" else ema_short,
+        "bb_ok":   bb_long   if direction == "LONG" else bb_short,
+        "vol_ok":  vol_long  if direction == "LONG" else vol_short,
     }
 
 
 # ═══════════════════════════════════════════
-#     التحليل الخفيف — للطلبات اليدوية (دايماً يرجع)
+#     التحليل الخفيف — للطلبات اليدوية
 # ═══════════════════════════════════════════
 def technical_analysis_light(df: pd.DataFrame) -> dict:
     close  = df['close']
@@ -261,8 +259,8 @@ def technical_analysis_light(df: pd.DataFrame) -> dict:
 
     atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
 
-    price_change_1h = round(((price - close.iloc[-12]) / (close.iloc[-12] + 1e-10)) * 100, 2)
-    price_change_4h = round(((price - close.iloc[-48]) / (close.iloc[-48] + 1e-10)) * 100, 2)
+    price_change_1h = round(((price - close.iloc[-4])  / (close.iloc[-4]  + 1e-10)) * 100, 2)
+    price_change_4h = round(((price - close.iloc[-16]) / (close.iloc[-16] + 1e-10)) * 100, 2)
 
     long_pts = sum([
         rsi_val < 45,
@@ -282,16 +280,16 @@ def technical_analysis_light(df: pd.DataFrame) -> dict:
     direction = "LONG" if long_pts >= short_pts else "SHORT"
     score = max(long_pts, short_pts)
 
-    if macd_cross_up:    macd_desc = "تقاطع صاعد 🚀"
+    if macd_cross_up:     macd_desc = "تقاطع صاعد 🚀"
     elif macd_cross_down: macd_desc = "تقاطع هابط 🔻"
     elif macd_bull:       macd_desc = "صاعد 📈"
     else:                 macd_desc = "هابط 📉"
 
-    rsi_ok  = rsi_val < 45 if direction=="LONG" else rsi_val > 55
-    macd_ok = (macd_cross_up or macd_bull) if direction=="LONG" else (macd_cross_down or macd_bear)
-    ema_ok  = (price > ema9 and ema9 > ema21) if direction=="LONG" else (price < ema9 and ema9 < ema21)
-    bb_ok   = price <= bb_lower * 1.02 if direction=="LONG" else price >= bb_upper * 0.98
-    vol_ok  = (vol_surge and price > close.iloc[-2]) if direction=="LONG" else (vol_surge and price < close.iloc[-2])
+    rsi_ok  = rsi_val < 45 if direction == "LONG" else rsi_val > 55
+    macd_ok = (macd_cross_up or macd_bull) if direction == "LONG" else (macd_cross_down or macd_bear)
+    ema_ok  = (price > ema9 and ema9 > ema21) if direction == "LONG" else (price < ema9 and ema9 < ema21)
+    bb_ok   = price <= bb_lower * 1.02 if direction == "LONG" else price >= bb_upper * 0.98
+    vol_ok  = (vol_surge and price > close.iloc[-2]) if direction == "LONG" else (vol_surge and price < close.iloc[-2])
 
     return {
         "direction":       direction,
@@ -371,7 +369,6 @@ EMA9: {data['ema9']} | EMA21: {data['ema21']} | EMA50: {data['ema50']}
 
 
 async def ai_analysis_detailed(symbol: str, data: dict) -> dict:
-    """تحليل AI أكثر تفصيلاً للطلبات اليدوية."""
     if not ANTHROPIC_API_KEY:
         return _fallback_analysis(data)
 
@@ -382,17 +379,12 @@ async def ai_analysis_detailed(symbol: str, data: dict) -> dict:
 السعر الحالي: {data['price']}
 RSI: {data['rsi']}
 MACD: {data['macd_desc']}
-موقع البولنجر: {data['bb_pct']:.0%} (0%=أسفل، 100%=أعلى)
+موقع البولنجر: {data['bb_pct']:.0%}
 تغيير آخر ساعة: {data['price_change_1h']}%
 تغيير آخر 4 ساعات: {data['price_change_4h']}%
 ارتفاع الحجم: {'نعم 🔥' if data['vol_surge'] else 'لا'}
 EMA9: {data['ema9']} | EMA21: {data['ema21']} | EMA50: {data['ema50']}
 المؤشرات المتوافقة: {data['indicator_count']}/5
-
-مطلوب:
-1. تحديد الاتجاه الفعلي: LONG أو SHORT أو SIDEWAYS
-2. نسبة ثقة دقيقة 1-99
-3. تعليق قصير بالعربي (جملة واحدة) يشرح السبب الرئيسي
 
 أجب بـ JSON فقط بدون backticks:
 {{"confidence": 72, "direction": "LONG", "comment": "RSI في منطقة شراء مع تقاطع MACD صاعد"}}"""
@@ -436,26 +428,31 @@ def _fallback_analysis(data: dict) -> dict:
 
 
 # ═══════════════════════════════════════════
-#     الأهداف الاحترافية — مع ATR
+#     الأهداف — مناسبة لشمعة 15 دقيقة
 # ═══════════════════════════════════════════
-def make_targets(price: float, signal: str, atr: float = None):
-    """أهداف احترافية كبيرة — TP5 يصل +40% و SL -4.5%"""
-    # نسب ثابتة كبيرة واحترافية
-    LONG_MULTS = [1.016, 1.048, 1.08, 1.14, 1.40]
-    SHORT_MULTS = [0.984, 0.952, 0.920, 0.860, 0.600]
-    LONG_SL_M  = 0.955   # -4.5%
-    SHORT_SL_M = 1.045   # +4.5%
-
+def make_targets(price: float, signal: str, atr: float = None, timeframe: str = "15m"):
     if signal == "LONG":
-        sl   = round(price * LONG_SL_M, 8)
-        tps  = [round(price * m, 8) for m in LONG_MULTS]
-        pcts = [f"+{round((m-1)*100,1)}%" for m in LONG_MULTS]
-        sl_p = f"-{round((1-LONG_SL_M)*100,1)}%"
+        sl   = round(price * 0.975, 8)   # -2.5%
+        tps  = [
+            round(price * 1.010, 8),      # +1%
+            round(price * 1.020, 8),      # +2%
+            round(price * 1.035, 8),      # +3.5%
+            round(price * 1.060, 8),      # +6%
+            round(price * 1.100, 8),      # +10%
+        ]
+        pcts = ["+1%", "+2%", "+3.5%", "+6%", "+10%"]
+        sl_p = "-2.5%"
     else:
-        sl   = round(price * SHORT_SL_M, 8)
-        tps  = [round(price * m, 8) for m in SHORT_MULTS]
-        pcts = [f"-{round((1-m)*100,1)}%" for m in SHORT_MULTS]
-        sl_p = f"+{round((SHORT_SL_M-1)*100,1)}%"
+        sl   = round(price * 1.025, 8)   # +2.5%
+        tps  = [
+            round(price * 0.990, 8),      # -1%
+            round(price * 0.980, 8),      # -2%
+            round(price * 0.965, 8),      # -3.5%
+            round(price * 0.940, 8),      # -6%
+            round(price * 0.900, 8),      # -10%
+        ]
+        pcts = ["-1%", "-2%", "-3.5%", "-6%", "-10%"]
+        sl_p = "+2.5%"
 
     return sl, tps, pcts, sl_p
 
@@ -464,17 +461,16 @@ def make_targets(price: float, signal: str, atr: float = None):
 #     تنسيق الأسعار
 # ═══════════════════════════════════════════
 def fmt(p: float) -> str:
-    if p >= 1:       return f"{p:,.4f}$"
-    elif p >= 0.01:  return f"{p:.6f}$"
-    else:            return f"{p:.8f}$"
+    if p >= 1:      return f"{p:,.4f}$"
+    elif p >= 0.01: return f"{p:.6f}$"
+    else:           return f"{p:.8f}$"
 
 
 # ═══════════════════════════════════════════
-#     بناء رسالة الإشارة التلقائية
+#     بناء رسالة الإشارة
 # ═══════════════════════════════════════════
 def build_signal_message(symbol, tech, ai, sl, tps, pcts, sl_p,
                          tp_hit=None, sl_hit=False):
-    """بناء رسالة الإشارة — مع دعم تحديث الأهداف."""
     if tp_hit is None:
         tp_hit = [False] * 5
 
@@ -492,24 +488,21 @@ def build_signal_message(symbol, tech, ai, sl, tps, pcts, sl_p,
     elif conf >= 70: stars = "⭐⭐⭐"
     else:            stars = "⭐⭐"
 
-    filled = int(conf / 10)
-    bar    = "█" * filled + "░" * (10 - filled)
+    filled  = int(conf / 10)
+    bar     = "█" * filled + "░" * (10 - filled)
     ai_line = f"🤖 {ai['comment']}\n" if ai.get('comment') else ""
 
-    # الأهداف مع علامة ✅ عند تحقيق كل هدف
-    tp_lines = ""
-    tp_emojis = ["🎯","🎯","🎯","🎯","🏆"]
+    tp_lines   = ""
+    tp_emojis  = ["🎯","🎯","🎯","🎯","🏆"]
     for i, (tp, pct) in enumerate(zip(tps, pcts)):
         check = "✅" if tp_hit[i] else "⬜"
         label = "TP5 — إغلاق الكامل" if i == 4 else f"TP{i+1}"
         tp_lines += f"{check} {tp_emojis[i]} {label}: {fmt(tp)}  ({pct})\n"
 
-    sl_status = "🔴 وقف الخسارة فُعِّل ❌" if sl_hit else f"🛑 SL: {fmt(sl)}  ({sl_p})"
-
-    # ملخص الأداء
-    hits = sum(tp_hit)
+    sl_status  = "🔴 وقف الخسارة فُعِّل ❌" if sl_hit else f"🛑 SL: {fmt(sl)}  ({sl_p})"
+    hits       = sum(tp_hit)
     status_line = ""
-    if hits > 0:
+    if hits > 0 and not sl_hit:
         status_line = f"\n📊 الأهداف المحققة: {hits}/5\n"
     if sl_hit:
         status_line = "\n❌ الصفقة أُغلقت بوقف الخسارة\n"
@@ -522,8 +515,8 @@ def build_signal_message(symbol, tech, ai, sl, tps, pcts, sl_p,
         f"➡️ الدخول: {fmt(price)}\n"
         f"{ai_line}"
         f"💯 الثقة: {conf}%  [{bar}]  {stars}\n"
-        f"📡 المؤشرات: {tech.get('indicator_count',0)}/5\n"
-        f"\n{tp_lines}\n"
+        f"📡 المؤشرات: {tech.get('indicator_count',0)}/5\n\n"
+        f"{tp_lines}\n"
         f"{sl_status}\n"
         f"{status_line}"
         f"📊 RSI: {tech['rsi']}  |  MACD: {tech['macd_desc']}\n"
@@ -537,23 +530,21 @@ def build_signal_message(symbol, tech, ai, sl, tps, pcts, sl_p,
 #     بناء رسالة التحليل اليدوي
 # ═══════════════════════════════════════════
 def build_analysis_message(symbol: str, tech: dict, ai: dict) -> str:
-    coin  = symbol.replace("USDT","")
-    conf  = ai['confidence']
-    price = tech['price']
+    coin      = symbol.replace("USDT","")
+    conf      = ai['confidence']
+    price     = tech['price']
     direction = tech['direction']
-
-    # الاتجاه من AI إذا موجود
-    ai_dir = ai.get('ai_direction', direction)
+    ai_dir    = ai.get('ai_direction', direction)
     is_sideways = ai_dir == "SIDEWAYS"
 
     if is_sideways:
-        dir_text = "↔️ تذبذب / لا اتجاه واضح"
+        dir_text  = "↔️ تذبذب / لا اتجاه واضح"
         dir_emoji = "⚠️"
     elif direction == "LONG":
-        dir_text = "📈 صاعدة"
+        dir_text  = "📈 صاعدة"
         dir_emoji = "🟢"
     else:
-        dir_text = "📉 هابطة"
+        dir_text  = "📉 هابطة"
         dir_emoji = "🔴"
 
     if conf >= 80:   stars = "⭐⭐⭐⭐⭐"
@@ -567,7 +558,6 @@ def build_analysis_message(symbol: str, tech: dict, ai: dict) -> str:
     vol_status  = f"{'✅' if tech['vol_ok'] else '❌'}  {'ارتفاع مفاجئ 🔥' if tech['vol_surge'] else 'حجم عادي'}"
     bb_status   = f"{'✅' if tech['bb_ok'] else '❌'}  موقع في البولنجر: {tech['bb_pct']:.0%}"
 
-    # توصية دخول فقط إذا ليس تذبذب
     rec = ""
     if not is_sideways and conf >= 55:
         atr = tech.get('atr')
@@ -610,10 +600,9 @@ def build_analysis_message(symbol: str, tech: dict, ai: dict) -> str:
 
 
 # ═══════════════════════════════════════════
-#     🆕 تتبع الأهداف وتحديث الرسائل
+#     تتبع الأهداف وتحديث الرسائل
 # ═══════════════════════════════════════════
 async def check_and_update_trades(bot: Bot):
-    """يفحص الأسعار الحالية ويحدث رسائل الإشارات عند تحقيق هدف أو SL."""
     if not active_trades:
         return
 
@@ -624,14 +613,13 @@ async def check_and_update_trades(bot: Bot):
             if not current_price:
                 continue
 
-            direction  = trade['direction']
-            tps        = trade['tps']
-            sl         = trade['sl']
-            tp_hit     = trade['tp_hit']
-            sl_hit     = trade['sl_hit']
-            updated    = False
+            direction = trade['direction']
+            tps       = trade['tps']
+            sl        = trade['sl']
+            tp_hit    = trade['tp_hit']
+            updated   = False
 
-            if sl_hit:
+            if trade['sl_hit']:
                 to_remove.append(msg_id)
                 continue
 
@@ -655,12 +643,10 @@ async def check_and_update_trades(bot: Bot):
                         trade['tp_hit'][i] = True
                         updated = True
 
-            # إذا تحقق كل الأهداف نزيل الصفقة
             if all(trade['tp_hit']):
                 to_remove.append(msg_id)
 
             if updated:
-                # بناء الرسالة المحدثة
                 new_text = build_signal_message(
                     symbol  = trade['symbol'],
                     tech    = trade['tech'],
@@ -678,7 +664,7 @@ async def check_and_update_trades(bot: Bot):
                         message_id = msg_id,
                         text       = new_text
                     )
-                    logger.info(f"✏️ تحديث رسالة {trade['symbol']} — TPs: {trade['tp_hit']} SL: {trade['sl_hit']}")
+                    logger.info(f"✏️ تحديث {trade['symbol']} TPs:{trade['tp_hit']} SL:{trade['sl_hit']}")
                 except Exception as edit_err:
                     logger.warning(f"تعذر تعديل الرسالة: {edit_err}")
 
@@ -696,7 +682,7 @@ async def scan_market(bot: Bot):
     global last_signal_time
 
     if not check_daily_limit():
-        logger.info(f"⛔ الحد اليومي ({DAILY_MAX} إشارة)")
+        logger.info(f"⛔ الحد اليومي ({DAILY_MAX})")
         return
 
     logger.info("🔍 بدأ الفحص...")
@@ -708,7 +694,7 @@ async def scan_market(bot: Bot):
             break
 
         try:
-            df = await get_klines(sym)
+            df = await get_klines(sym, interval="15m")
             if df is None or len(df) < 50:
                 await asyncio.sleep(0.2)
                 continue
@@ -735,7 +721,7 @@ async def scan_market(bot: Bot):
                 await asyncio.sleep(0.2)
                 continue
 
-            # ✅ سحب السعر اللحظي قبل الإرسال مباشرة لمنع فرق السعر
+            # ✅ سعر لحظي قبل الإرسال مباشرة
             live_price = await get_current_price(sym)
             if live_price and live_price > 0:
                 tech['price'] = live_price
@@ -751,7 +737,7 @@ async def scan_market(bot: Bot):
 
             sent_msg = await bot.send_message(chat_id=CHAT_ID, text=msg)
 
-            # ✅ تسجيل الصفقة للتتبع
+            # ✅ تسجيل للتتبع
             active_trades[sent_msg.message_id] = {
                 'symbol':    sym,
                 'direction': tech['direction'],
@@ -770,7 +756,7 @@ async def scan_market(bot: Bot):
             last_signal_time  = now_time
             increment_daily()
             found += 1
-            logger.info(f"📤 {sym} {tech['direction']} {ai['confidence']}% — اليوم: {daily_count}/{DAILY_MAX}")
+            logger.info(f"📤 {sym} {tech['direction']} {ai['confidence']}% اليوم:{daily_count}/{DAILY_MAX}")
             await asyncio.sleep(2)
 
         except Exception as e:
@@ -790,14 +776,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌟 مرحباً في سراب للإشارات! 🌟\n\n"
         f"📡 يراقب {len(syms)} عملة (تحت $10)\n"
         f"⏱ فحص تلقائي كل 3 دقائق\n"
+        f"🕯️ شمعة 15 دقيقة\n"
         f"🤖 AI: {ai_status}\n"
-        f"💯 حد الثقة الأدنى: 70%\n"
+        f"💯 حد الثقة: 70%\n"
         f"🎯 الحد اليومي: {DAILY_MAX} إشارة\n"
-        f"✏️ تحديث تلقائي للأهداف في الرسالة\n\n"
+        f"✏️ تحديث تلقائي للأهداف\n\n"
         f"الأوامر:\n"
         f"/scan — فحص فوري\n"
         f"/status — حالة البوت\n"
-        f"🔎 أرسل رمز عملة (مثل XRP أو XRPUSDT) لتحليلها فوراً"
+        f"🔎 أرسل رمز عملة (مثل XRP) لتحليلها"
     )
 
 
@@ -813,31 +800,26 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ سراب يعمل\n\n"
         f"⏱ فحص كل: 3 دقائق\n"
+        f"🕯️ شمعة: 15 دقيقة\n"
         f"📊 العملات: {len(syms)}\n"
         f"💰 الحد: $10\n"
-        f"💯 حد الثقة: 70%+\n"
+        f"💯 حد الثقة: 70%\n"
         f"📡 إشارات اليوم: {daily_count}/{DAILY_MAX}\n"
-        f"📈 صفقات نشطة (تتبع): {len(active_trades)}\n"
+        f"📈 صفقات نشطة: {len(active_trades)}\n"
         f"🤖 AI: {ai_status}"
     )
 
 
-# ═══════════════════════════════════════════
-#     تحليل عملة عند الطلب — دايماً يعطي رد
-# ═══════════════════════════════════════════
 async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().upper()
-
-    # تجاهل الرسائل الطويلة أو التي تحتوي مسافات
     if len(text) < 2 or len(text) > 12 or ' ' in text:
         return
 
     symbol = text if text.endswith("USDT") else f"{text}USDT"
-
     await update.message.reply_text(f"🔎 جاري تحليل {symbol}...")
 
     try:
-        df = await get_klines(symbol, interval="5m", limit=200)
+        df = await get_klines(symbol, interval="15m", limit=200)
         if df is None or len(df) < 50:
             await update.message.reply_text(
                 f"⚠️ لم أجد بيانات لـ {symbol}\n"
@@ -845,17 +827,14 @@ async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        # ✅ تحليل خفيف — يرجع دائماً نتيجة
         tech = technical_analysis_light(df)
 
-        # ✅ سحب السعر اللحظي قبل إرسال التحليل
+        # ✅ سعر لحظي
         live_price = await get_current_price(symbol)
         if live_price and live_price > 0:
             tech['price'] = live_price
 
-        # ✅ AI تفصيلي يحدد الاتجاه الحقيقي
-        ai = await ai_analysis_detailed(symbol, tech)
-
+        ai  = await ai_analysis_detailed(symbol, tech)
         msg = build_analysis_message(symbol, tech, ai)
         await update.message.reply_text(msg)
 
@@ -865,14 +844,13 @@ async def handle_coin_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ═══════════════════════════════════════════
-#     Jobs التلقائية
+#     Jobs
 # ═══════════════════════════════════════════
 async def auto_scan(context: ContextTypes.DEFAULT_TYPE):
     await scan_market(context.bot)
 
 
 async def auto_price_check(context: ContextTypes.DEFAULT_TYPE):
-    """يفحص الأسعار ويحدث رسائل الأهداف."""
     await check_and_update_trades(context.bot)
 
 
@@ -887,12 +865,10 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coin_request))
 
-    # فحص السوق كل 3 دقائق
-    app.job_queue.run_repeating(auto_scan, interval=CHECK_INTERVAL, first=20)
-    # تتبع الأهداف وتحديث الرسائل كل دقيقة
+    app.job_queue.run_repeating(auto_scan,        interval=CHECK_INTERVAL,       first=20)
     app.job_queue.run_repeating(auto_price_check, interval=PRICE_CHECK_INTERVAL, first=30)
 
-    logger.info("🚀 سراب للإشارات يعمل — جودة عالية + تتبع أهداف!")
+    logger.info("🚀 سراب — شمعة 15 دقيقة + سعر لحظي!")
     app.run_polling()
 
 

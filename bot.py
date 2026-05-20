@@ -27,7 +27,7 @@ SIGNAL_COOLDOWN      = 3600
 GLOBAL_COOLDOWN      = 120
 DAILY_MAX            = 40
 TREND_MIN_SLOPE      = 0.0003
-PRICE_CHECK_INTERVAL = 60
+PRICE_CHECK_INTERVAL = 10
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
